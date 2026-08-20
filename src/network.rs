@@ -2,7 +2,7 @@ use std::{io, net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Semaphore,
     time,
@@ -14,6 +14,8 @@ use crate::{
     config::ServerConfig,
     protocol,
 };
+
+const HEADER_TERMINATOR: &[u8; 4] = b"\r\n\r\n";
 
 #[derive(Debug)]
 enum ReadRequestError {
@@ -122,10 +124,13 @@ async fn handle_connection(
     write_and_close(stream, &response).await
 }
 
-async fn read_raw_request(
-    stream: &mut TcpStream,
+async fn read_raw_request<R>(
+    stream: &mut R,
     max_request_bytes: usize,
-) -> std::result::Result<Vec<u8>, ReadRequestError> {
+) -> std::result::Result<Vec<u8>, ReadRequestError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut request = Vec::with_capacity(max_request_bytes.min(1_024));
     let mut chunk = [0_u8; 1_024];
 
@@ -137,18 +142,26 @@ async fn read_raw_request(
 
         request.extend_from_slice(&chunk[..bytes_read]);
 
-        if request.len() > max_request_bytes {
-            return Err(ReadRequestError::TooLarge);
+        if let Some(header_len) = complete_header_len(&request) {
+            if header_len > max_request_bytes {
+                return Err(ReadRequestError::TooLarge);
+            }
+
+            request.truncate(header_len);
+            return Ok(request);
         }
 
-        if has_complete_headers(&request) {
-            return Ok(request);
+        if request.len() >= max_request_bytes {
+            return Err(ReadRequestError::TooLarge);
         }
     }
 }
 
-fn has_complete_headers(request: &[u8]) -> bool {
-    request.windows(4).any(|window| window == b"\r\n\r\n")
+fn complete_header_len(request: &[u8]) -> Option<usize> {
+    request
+        .windows(HEADER_TERMINATOR.len())
+        .position(|window| window == HEADER_TERMINATOR)
+        .map(|position| position + HEADER_TERMINATOR.len())
 }
 
 async fn write_and_close(stream: &mut TcpStream, response: &[u8]) -> Result<()> {
@@ -159,11 +172,45 @@ async fn write_and_close(stream: &mut TcpStream, response: &[u8]) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::duplex;
+
     use super::*;
 
     #[test]
-    fn detects_complete_headers_only_at_full_delimiter() {
-        assert!(!has_complete_headers(b"GET / HTTP/1.1\r\nHost: x\r\n"));
-        assert!(has_complete_headers(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+    fn finds_only_a_complete_header_delimiter() {
+        assert_eq!(complete_header_len(b"GET / HTTP/1.1\r\nHost: x\r\n"), None);
+
+        let headers = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(complete_header_len(headers), Some(headers.len()));
+    }
+
+    #[tokio::test]
+    async fn discards_body_and_pipelined_bytes_after_headers() {
+        let headers = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut wire = headers.to_vec();
+        wire.extend_from_slice(b"ignored bodyGET /hello HTTP/1.1\r\n\r\n");
+        let (mut writer, mut reader) = duplex(wire.len());
+
+        writer.write_all(&wire).await.expect("write test request");
+        drop(writer);
+
+        let request = read_raw_request(&mut reader, headers.len())
+            .await
+            .expect("header frame fits exactly");
+        assert_eq!(request, headers);
+    }
+
+    #[tokio::test]
+    async fn rejects_an_incomplete_header_at_the_size_limit() {
+        let request = b"GET / HTTP/1.1\r\nHost: unfinished";
+        let (mut writer, mut reader) = duplex(request.len());
+
+        writer.write_all(request).await.expect("write test request");
+        drop(writer);
+
+        assert!(matches!(
+            read_raw_request(&mut reader, request.len()).await,
+            Err(ReadRequestError::TooLarge)
+        ));
     }
 }
