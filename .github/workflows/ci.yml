@@ -60,7 +60,7 @@ jobs:
             run_check "cargo test --locked" \
               cargo +1.97.1 test --locked --all-features
             run_check "cargo build --locked" \
-              cargo +1.97.1 build --locked --bin gput
+              cargo +1.97.1 build --locked --bins
             build_status=$?
 
             if (( build_status == 0 )); then
@@ -113,9 +113,9 @@ jobs:
           state="$CHECK_RESULT"
           if [[ "$state" != "success" ]]; then
             state="failure"
-            description="Rust, protocol, or GPU smoke checks failed"
+            description="Rust, protocol, benchmark, or GPU smoke checks failed"
           else
-            description="locked build, tests, and CPU/GPU smoke passed"
+            description="locked build, tests, benchmark, and CPU/GPU smoke passed"
           fi
 
           gh api --method POST \
