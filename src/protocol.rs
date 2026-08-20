@@ -27,9 +27,7 @@ pub fn route_request(request: &[u8], backend: &'static str) -> Vec<u8> {
             );
             build_response(200, "OK", JSON_CONTENT_TYPE, body.as_bytes(), backend)
         }
-        RequestRoute::Health => {
-            build_response(200, "OK", TEXT_CONTENT_TYPE, b"ok\n", backend)
-        }
+        RequestRoute::Health => build_response(200, "OK", TEXT_CONTENT_TYPE, b"ok\n", backend),
         RequestRoute::Hello => {
             let body: &[u8] = if backend == "gpu" {
                 b"hello from a compute shader\n"
@@ -38,13 +36,9 @@ pub fn route_request(request: &[u8], backend: &'static str) -> Vec<u8> {
             };
             build_response(200, "OK", TEXT_CONTENT_TYPE, body, backend)
         }
-        RequestRoute::NotFound => build_response(
-            404,
-            "Not Found",
-            TEXT_CONTENT_TYPE,
-            b"not found\n",
-            backend,
-        ),
+        RequestRoute::NotFound => {
+            build_response(404, "Not Found", TEXT_CONTENT_TYPE, b"not found\n", backend)
+        }
         RequestRoute::BadRequest => build_response(
             400,
             "Bad Request",
