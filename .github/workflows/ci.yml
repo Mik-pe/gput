@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   issues: write
   statuses: write
 
@@ -55,12 +55,12 @@ jobs:
           if (( setup_status == 0 )); then
             run_check "cargo fmt --check" \
               cargo +1.97.1 fmt --check
-            run_check "cargo clippy" \
-              cargo +1.97.1 clippy --all-targets --all-features -- -D warnings
-            run_check "cargo test" \
-              cargo +1.97.1 test --all-features
-            run_check "cargo build" \
-              cargo +1.97.1 build --bin gput
+            run_check "cargo clippy --locked" \
+              cargo +1.97.1 clippy --locked --all-targets --all-features -- -D warnings
+            run_check "cargo test --locked" \
+              cargo +1.97.1 test --locked --all-features
+            run_check "cargo build --locked" \
+              cargo +1.97.1 build --locked --bin gput
             build_status=$?
 
             if (( build_status == 0 )); then
@@ -103,32 +103,6 @@ jobs:
             echo "result=failure" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit the generated dependency lock
-        if: steps.checks.outputs.result == 'success'
-        shell: bash
-        run: |
-          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
-            echo "Cargo.lock is already tracked"
-            exit 0
-          fi
-
-          test -f Cargo.lock
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- Cargo.lock
-          git commit -m "chore: lock the dependency reactor"
-          git push origin HEAD:main
-
-      - name: Preserve generated Cargo.lock
-        if: always() && hashFiles('Cargo.lock') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-lock-${{ github.sha }}
-          path: Cargo.lock
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-
       - name: Publish commit status
         if: always()
         env:
@@ -141,7 +115,7 @@ jobs:
             state="failure"
             description="Rust, protocol, or GPU smoke checks failed"
           else
-            description="format, Clippy, tests, and CPU/GPU smoke passed"
+            description="locked build, tests, and CPU/GPU smoke passed"
           fi
 
           gh api --method POST \
