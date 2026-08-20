@@ -41,6 +41,7 @@ The name is the union of **GPU** and **throughput**, with enough resemblance to 
 - automatic CPU fallback when no compute-capable adapter is available
 - limits for request size, connection count, queue depth, and slow clients
 - pinned Rust toolchain and committed dependency lockfile
+- built-in concurrent benchmark client with warmup, backend verification, percentiles, and JSON output
 - unit tests, WGSL parse/validation, CPU socket smoke, and Vulkan compute smoke
 
 Current routes:
@@ -88,12 +89,38 @@ cargo run --release --locked -- \
 
 `WGPU_BACKEND` and `WGPU_ADAPTER_NAME` can influence adapter selection.
 
-## Prove that it breathes
+## Measure the damage
 
-Build once, then exercise the complete TCP path, error responses, query routing, and a concurrent burst:
+Start the server with either backend, then run the included load generator in another terminal:
 
 ```bash
-cargo build --locked --bin gput
+cargo run --release --locked --bin gput-bench -- \
+  --address 127.0.0.1:8080 \
+  --path /hello \
+  --requests 100000 \
+  --concurrency 256 \
+  --warmup 2000 \
+  --expected-backend gpu
+```
+
+It reports elapsed time, requests per second, total response bytes, and p50/p95/p99/max latency. Machine-readable output is available with `--json`:
+
+```bash
+cargo run --release --locked --bin gput-bench -- \
+  --requests 10000 \
+  --concurrency 128 \
+  --expected-backend cpu \
+  --json
+```
+
+The benchmark opens one TCP connection per request because that is the server's current contract. It is intended for controlled CPU-versus-GPU comparisons of this repository, not as a general replacement for mature HTTP benchmarking tools.
+
+## Prove that it breathes
+
+Build both binaries, then exercise the complete TCP path, malformed requests, error responses, query routing, a concurrent burst, and the built-in benchmark:
+
+```bash
+cargo build --locked --bins
 bash scripts/smoke.sh cpu target/debug/gput
 bash scripts/smoke.sh gpu target/debug/gput
 ```
@@ -106,9 +133,9 @@ CI runs:
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
-cargo build --locked --bin gput
+cargo build --locked --bins
 bash scripts/smoke.sh cpu target/debug/gput
-# plus the same smoke suite against Vulkan/Lavapipe
+# plus the same smoke and benchmark suite against Vulkan/Lavapipe
 ```
 
 A red direct-to-main build opens an issue containing the failure log. The next green build closes superseded CI failure issues automatically.
