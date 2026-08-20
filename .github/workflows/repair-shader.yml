@@ -1,0 +1,137 @@
+name: repair shader parser
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Tighten request-line validation and add the regression case
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          shader_path = Path("src/processor/http.wgsl")
+          shader = shader_path.read_text()
+          old_version_check = """fn has_supported_http_version(request_index: u32, version_start: u32, input_len: u32) -> bool {
+              if (version_start + 8u >= input_len) {
+                  return false;
+              }
+
+              let version_matches = request_byte(request_index, version_start + 0u) == 72u
+                  && request_byte(request_index, version_start + 1u) == 84u
+                  && request_byte(request_index, version_start + 2u) == 84u
+                  && request_byte(request_index, version_start + 3u) == 80u
+                  && request_byte(request_index, version_start + 4u) == 47u
+                  && request_byte(request_index, version_start + 5u) == 49u
+                  && request_byte(request_index, version_start + 6u) == 46u
+                  && (
+                      request_byte(request_index, version_start + 7u) == 48u
+                      || request_byte(request_index, version_start + 7u) == 49u
+                  );
+
+              let terminator = request_byte(request_index, version_start + 8u);
+              return version_matches && (terminator == 13u || terminator == 10u);
+          }
+          """
+          new_version_check = """fn has_supported_http_version(request_index: u32, version_start: u32, input_len: u32) -> bool {
+              if (version_start + 8u >= input_len) {
+                  return false;
+              }
+
+              let version_matches = request_byte(request_index, version_start + 0u) == 72u
+                  && request_byte(request_index, version_start + 1u) == 84u
+                  && request_byte(request_index, version_start + 2u) == 84u
+                  && request_byte(request_index, version_start + 3u) == 80u
+                  && request_byte(request_index, version_start + 4u) == 47u
+                  && request_byte(request_index, version_start + 5u) == 49u
+                  && request_byte(request_index, version_start + 6u) == 46u
+                  && (
+                      request_byte(request_index, version_start + 7u) == 48u
+                      || request_byte(request_index, version_start + 7u) == 49u
+                  );
+
+              if (!version_matches) {
+                  return false;
+              }
+
+              let terminator = request_byte(request_index, version_start + 8u);
+              if (terminator == 10u) {
+                  return true;
+              }
+
+              return terminator == 13u
+                  && version_start + 9u < input_len
+                  && request_byte(request_index, version_start + 9u) == 10u;
+          }
+          """
+
+          if shader.count(old_version_check) != 1:
+              raise SystemExit("expected exactly one old WGSL version check")
+          shader_path.write_text(shader.replace(old_version_check, new_version_check))
+
+          smoke_path = Path("scripts/smoke.sh")
+          smoke = smoke_path.read_text()
+          old_case = '    (b"GET / GPUT/6.6\\r\\n\\r\\n", b"HTTP/1.1 400 Bad Request\\r\\n"),\n'
+          new_case = old_case + '    (b"GET / HTTP/1.1\\rX\\nHost: smoke\\r\\n\\r\\n", b"HTTP/1.1 400 Bad Request\\r\\n"),\n'
+          if smoke.count(old_case) != 1:
+              raise SystemExit("expected exactly one malformed-version smoke case")
+          smoke_path.write_text(smoke.replace(old_case, new_case))
+          PY
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+
+      - name: Validate Rust and WGSL
+        run: |
+          cargo +1.97.1 fmt --check
+          cargo +1.97.1 clippy --locked --all-targets --all-features -- -D warnings
+          cargo +1.97.1 test --locked --all-features
+          cargo +1.97.1 build --locked --bin gput
+
+      - name: Exercise CPU socket path
+        run: GPUT_SMOKE_PORT=18082 bash scripts/smoke.sh cpu target/debug/gput
+
+      - name: Install software Vulkan adapter
+        run: |
+          if ! find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit | grep --quiet .; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends mesa-vulkan-drivers
+          fi
+
+      - name: Exercise actual Vulkan compute path
+        shell: bash
+        run: |
+          lvp_icd="$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)"
+          runtime_dir="$(mktemp -d)"
+          chmod 700 "$runtime_dir"
+          trap 'rm -rf "$runtime_dir"' EXIT
+          env \
+            GPUT_SMOKE_PORT=18083 \
+            WGPU_BACKEND=vulkan \
+            VK_DRIVER_FILES="$lvp_icd" \
+            VK_ICD_FILENAMES="$lvp_icd" \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            LIBGL_ALWAYS_SOFTWARE=true \
+            GALLIUM_DRIVER=llvmpipe \
+          bash scripts/smoke.sh gpu target/debug/gput
+
+      - name: Commit the repaired parser directly to main
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- src/processor/http.wgsl scripts/smoke.sh
+          git diff --cached --quiet && exit 0
+          git commit -m "fix: reject malformed request-line terminators on the GPU"
+          git push origin HEAD:main
