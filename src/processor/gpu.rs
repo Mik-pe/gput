@@ -83,13 +83,13 @@ impl GpuProcessor {
             response_stride_words * size_of::<u32>(),
         )?;
 
-        let instance = wgpu::Instance::new(
-            wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
-        );
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: None,
+            apply_limit_buckets: false,
         }))
         .context("no suitable GPU adapter was found")?;
 
@@ -99,7 +99,10 @@ impl GpuProcessor {
             .flags
             .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
         {
-            bail!("adapter {} does not support compute shaders", adapter_info.name);
+            bail!(
+                "adapter {} does not support compute shaders",
+                adapter_info.name
+            );
         }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -117,42 +120,41 @@ impl GpuProcessor {
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gput-bind-group-layout"),
-                entries: &[
-                    buffer_layout_entry(
-                        0,
-                        wgpu::BufferBindingType::Uniform,
-                        false,
-                        size_of::<Params>(),
-                    ),
-                    buffer_layout_entry(
-                        1,
-                        wgpu::BufferBindingType::Storage { read_only: true },
-                        false,
-                        size_of::<RequestMeta>(),
-                    ),
-                    buffer_layout_entry(
-                        2,
-                        wgpu::BufferBindingType::Storage { read_only: true },
-                        false,
-                        size_of::<u32>(),
-                    ),
-                    buffer_layout_entry(
-                        3,
-                        wgpu::BufferBindingType::Storage { read_only: false },
-                        false,
-                        size_of::<ResponseMeta>(),
-                    ),
-                    buffer_layout_entry(
-                        4,
-                        wgpu::BufferBindingType::Storage { read_only: false },
-                        false,
-                        size_of::<u32>(),
-                    ),
-                ],
-            });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gput-bind-group-layout"),
+            entries: &[
+                buffer_layout_entry(
+                    0,
+                    wgpu::BufferBindingType::Uniform,
+                    false,
+                    size_of::<Params>(),
+                ),
+                buffer_layout_entry(
+                    1,
+                    wgpu::BufferBindingType::Storage { read_only: true },
+                    false,
+                    size_of::<RequestMeta>(),
+                ),
+                buffer_layout_entry(
+                    2,
+                    wgpu::BufferBindingType::Storage { read_only: true },
+                    false,
+                    size_of::<u32>(),
+                ),
+                buffer_layout_entry(
+                    3,
+                    wgpu::BufferBindingType::Storage { read_only: false },
+                    false,
+                    size_of::<ResponseMeta>(),
+                ),
+                buffer_layout_entry(
+                    4,
+                    wgpu::BufferBindingType::Storage { read_only: false },
+                    false,
+                    size_of::<u32>(),
+                ),
+            ],
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gput-pipeline-layout"),
@@ -300,7 +302,8 @@ impl GpuProcessor {
                     ..(request_index + 1) * self.request_stride_words],
             );
             request_meta.push(RequestMeta {
-                input_len: u32::try_from(request.len()).context("request length does not fit u32")?,
+                input_len: u32::try_from(request.len())
+                    .context("request length does not fit u32")?,
                 _padding_0: 0,
                 _padding_1: 0,
                 _padding_2: 0,
@@ -329,10 +332,9 @@ impl GpuProcessor {
 
         let response_meta_copy_bytes = u64::try_from(request_count * size_of::<ResponseMeta>())
             .context("response metadata copy size overflow")?;
-        let output_copy_bytes = u64::try_from(
-            request_count * self.response_stride_words * size_of::<u32>(),
-        )
-        .context("response output copy size overflow")?;
+        let output_copy_bytes =
+            u64::try_from(request_count * self.response_stride_words * size_of::<u32>())
+                .context("response output copy size overflow")?;
 
         let mut encoder = self
             .device
@@ -375,7 +377,9 @@ impl GpuProcessor {
         response_meta_copy_bytes: u64,
         output_copy_bytes: u64,
     ) -> Result<Vec<Vec<u8>>> {
-        let meta_slice = self.response_meta_readback.slice(0..response_meta_copy_bytes);
+        let meta_slice = self
+            .response_meta_readback
+            .slice(0..response_meta_copy_bytes);
         let output_slice = self.output_readback.slice(0..output_copy_bytes);
         let (meta_sender, meta_receiver) = mpsc::sync_channel(1);
         let (output_sender, output_receiver) = mpsc::sync_channel(1);
