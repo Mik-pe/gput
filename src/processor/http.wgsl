@@ -396,8 +396,18 @@ fn has_supported_http_version(request_index: u32, version_start: u32, input_len:
             || request_byte(request_index, version_start + 7u) == 49u
         );
 
+    if (!version_matches) {
+        return false;
+    }
+
     let terminator = request_byte(request_index, version_start + 8u);
-    return version_matches && (terminator == 13u || terminator == 10u);
+    if (terminator == 10u) {
+        return true;
+    }
+
+    return terminator == 13u
+        && version_start + 9u < input_len
+        && request_byte(request_index, version_start + 9u) == 10u;
 }
 
 fn response_byte_len(response_id: u32) -> u32 {

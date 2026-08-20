@@ -138,6 +138,7 @@ cases = [
     (b"GET /health HTTP/1.0\r\n\r\n", b"HTTP/1.1 200 OK\r\n"),
     (b"GET /hello?source=raw HTTP/1.1\r\nHost: smoke\r\n\r\n", b"HTTP/1.1 200 OK\r\n"),
     (b"GET / GPUT/6.6\r\n\r\n", b"HTTP/1.1 400 Bad Request\r\n"),
+    (b"GET / HTTP/1.1\rX\nHost: smoke\r\n\r\n", b"HTTP/1.1 400 Bad Request\r\n"),
     (b"POST / HTTP/1.1\r\n\r\n", b"HTTP/1.1 405 Method Not Allowed\r\n"),
 ]
 
