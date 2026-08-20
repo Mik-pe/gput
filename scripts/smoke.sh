@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 backend="${1:-}"
 binary="${2:-target/debug/gput}"
+bench_binary="$(dirname "$binary")/gput-bench"
 port="${GPUT_SMOKE_PORT:-18080}"
 address="127.0.0.1:${port}"
 base_url="http://${address}"
@@ -14,6 +15,11 @@ fi
 
 if [[ ! -x "$binary" ]]; then
   echo "gput binary is missing or not executable: $binary" >&2
+  exit 2
+fi
+
+if [[ ! -x "$bench_binary" ]]; then
+  echo "gput-bench binary is missing or not executable: $bench_binary" >&2
   exit 2
 fi
 
@@ -168,6 +174,33 @@ fi
 seq 1 96 | xargs -P 32 -I '{}' bash -c '
   [[ "$(curl --silent --show-error --fail --max-time 2 "$GPUT_SMOKE_ENDPOINT")" == "$GPUT_SMOKE_EXPECTED" ]]
 '
+
+"$bench_binary" \
+  --address "$address" \
+  --path /hello \
+  --requests 128 \
+  --concurrency 32 \
+  --warmup 16 \
+  --timeout-millis 2000 \
+  --expected-backend "$backend" \
+  --json \
+  >"$work_dir/bench.json"
+
+BENCH_RESULT="$work_dir/bench.json" python3 - <<'PY'
+import json
+import os
+
+with open(os.environ["BENCH_RESULT"], encoding="utf-8") as result_file:
+    result = json.load(result_file)
+
+assert result["requests"] == 128, result
+assert result["concurrency"] == 32, result
+assert result["elapsed_seconds"] > 0, result
+assert result["requests_per_second"] > 0, result
+assert result["latency_nanos"]["p50"] > 0, result
+assert result["latency_nanos"]["max"] >= result["latency_nanos"]["p99"], result
+assert result["response_bytes"] > 0, result
+PY
 
 kill -INT "$server_pid"
 wait "$server_pid"
