@@ -1,8 +1,10 @@
 # gput
 
+[![ci](https://github.com/Mik-pe/gput/actions/workflows/ci.yml/badge.svg)](https://github.com/Mik-pe/gput/actions/workflows/ci.yml)
+
 **GPU throughput applied to the least deserving workload imaginable.**
 
-`gput` is an experimental HTTP/1.1 server written in Rust. The CPU accepts TCP connections and batches raw request bytes. A GPU compute shader then parses the request line, selects a route, and writes the complete HTTP response back into a storage buffer.
+`gput` is an experimental HTTP/1.1 server written in Rust. The CPU accepts TCP connections and batches raw request bytes. A GPU compute shader parses the request line, selects a route, and writes the complete HTTP response into a storage buffer.
 
 ```text
 TCP socket
@@ -11,7 +13,7 @@ TCP socket
 minimal Rust framing
     |
     v
-request batch
+bounded request batch
     |
     v
 wgpu compute dispatch
@@ -19,7 +21,7 @@ wgpu compute dispatch
     |  route by FNV-1a hash
     |  write status, headers, and body
     v
-readback buffer
+GPU readback
     |
     v
 TCP socket
@@ -29,16 +31,17 @@ The name is the union of **GPU** and **throughput**, with enough resemblance to 
 
 ## What works
 
-- Real TCP listener built on Tokio
-- bounded request queue with micro-batching
+- real TCP listener built on Tokio
+- bounded request queue with configurable micro-batching
 - headless compute through `wgpu`
 - raw HTTP request-line parsing in WGSL
-- hashed routing in WGSL
+- query-string stripping and FNV-1a route selection in WGSL
 - complete HTTP responses generated in WGSL
-- CPU baseline backend
+- CPU baseline backend using the same network and batching path
 - automatic CPU fallback when no compute-capable adapter is available
-- request size, connection count, queue depth, and slow-client limits
-- unit tests for protocol behavior, batching, configuration, and WGSL validation
+- limits for request size, connection count, queue depth, and slow clients
+- pinned Rust toolchain and committed dependency lockfile
+- unit tests, WGSL parse/validation, CPU socket smoke, and Vulkan compute smoke
 
 Current routes:
 
@@ -54,7 +57,7 @@ Only `GET` is accepted. Each connection handles one request and closes. That is 
 ## Run it
 
 ```bash
-cargo run --release -- --backend auto --bind 127.0.0.1:8080
+cargo run --release --locked -- --backend auto --bind 127.0.0.1:8080
 ```
 
 Then:
@@ -68,14 +71,14 @@ curl -i http://127.0.0.1:8080/hello
 Force a backend:
 
 ```bash
-cargo run --release -- --backend gpu
-cargo run --release -- --backend cpu
+cargo run --release --locked -- --backend gpu
+cargo run --release --locked -- --backend cpu
 ```
 
 Useful tuning knobs:
 
 ```bash
-cargo run --release -- \
+cargo run --release --locked -- \
   --backend gpu \
   --batch-size 256 \
   --batch-wait-micros 50 \
@@ -83,7 +86,32 @@ cargo run --release -- \
   --max-request-bytes 4096
 ```
 
-`WGPU_BACKEND` and `WGPU_ADAPTER_NAME` can be used to influence adapter selection.
+`WGPU_BACKEND` and `WGPU_ADAPTER_NAME` can influence adapter selection.
+
+## Prove that it breathes
+
+Build once, then exercise the complete TCP path, error responses, query routing, and a concurrent burst:
+
+```bash
+cargo build --locked --bin gput
+bash scripts/smoke.sh cpu target/debug/gput
+bash scripts/smoke.sh gpu target/debug/gput
+```
+
+The CI GPU smoke forces `wgpu` through Vulkan and Mesa Lavapipe. That executes the real upload, compute dispatch, shader parser/router, readback, and socket response path on a deterministic software Vulkan adapter. It proves the GPU code path works end to end, but it is not a substitute for performance measurements on a discrete AMD, Intel, or NVIDIA GPU.
+
+CI runs:
+
+```bash
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo build --locked --bin gput
+bash scripts/smoke.sh cpu target/debug/gput
+# plus the same smoke suite against Vulkan/Lavapipe
+```
+
+A red direct-to-main build opens an issue containing the failure log. The next green build closes superseded CI failure issues automatically.
 
 ## Development rule
 
@@ -91,6 +119,6 @@ Work goes directly into `main`. No mandatory branches, no default pull requests,
 
 ## Honest limitations
 
-This is not a production web server. It currently has no TLS, keep-alive, request bodies, HTTP/2, HTTP/3, dynamic route table, persistent mapped ring buffers, or zero-copy NIC integration. The first objective is to obtain defensible CPU-versus-GPU measurements without hiding the expensive upload, dispatch, synchronization, and readback steps.
+This is not a production web server. It currently has no TLS, keep-alive, request bodies, HTTP/2, HTTP/3, dynamic route table, persistent mapped ring buffers, or zero-copy NIC integration. The first objective is to obtain defensible CPU-versus-GPU measurements without hiding upload, dispatch, synchronization, and readback costs.
 
 The sensible future endpoint is one where parsing and routing lead directly into GPU-native work such as image processing, hashing, vector search, or inference. Until then, this is a very polished electrical joke.
