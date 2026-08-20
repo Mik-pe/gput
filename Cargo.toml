@@ -1,0 +1,29 @@
+[package]
+name = "gput"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "An intentionally unreasonable HTTP/1.1 server that parses and routes requests in GPU compute shaders"
+license = "MIT"
+repository = "https://github.com/Mik-pe/gput"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossbeam-channel = "0.5"
+pollster = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+wgpu = "30.0.0"
+
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
