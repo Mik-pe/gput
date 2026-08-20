@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  issues: write
+  statuses: write
 
 jobs:
   rust:
@@ -15,17 +17,107 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - name: Run the whole Rust gauntlet
+        id: checks
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          : > ci.log
+          failed=0
 
-      - name: Select pinned Rust toolchain
-        run: rustup default 1.97.1
+          run_check() {
+            local label="$1"
+            shift
+            printf '\n===== %s =====\n' "$label" | tee -a ci.log
+            "$@" 2>&1 | tee -a ci.log
+            local status=${PIPESTATUS[0]}
+            if (( status != 0 )); then
+              failed=1
+            fi
+            return "$status"
+          }
 
-      - name: Check formatting
-        run: cargo fmt --check
+          run_check "install Rust 1.97.1" \
+            rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          setup_status=$?
 
-      - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
+          if (( setup_status == 0 )); then
+            run_check "cargo fmt --check" \
+              cargo +1.97.1 fmt --check
+            run_check "cargo clippy" \
+              cargo +1.97.1 clippy --all-targets --all-features -- -D warnings
+            run_check "cargo test" \
+              cargo +1.97.1 test --all-features
+          else
+            printf '\nRust setup failed; cargo checks were skipped.\n' | tee -a ci.log
+          fi
 
-      - name: Test
-        run: cargo test --all-features
+          if (( failed == 0 )); then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish commit status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECK_RESULT: ${{ steps.checks.outputs.result }}
+        shell: bash
+        run: |
+          state="$CHECK_RESULT"
+          if [[ "$state" != "success" ]]; then
+            state="failure"
+            description="format, clippy, or tests failed"
+          else
+            description="format, clippy, and tests passed"
+          fi
+
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state="$state" \
+            -f context="gput/ci" \
+            -f description="$description" \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Open a failure log issue
+        if: always() && steps.checks.outputs.result != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          touch ci.log
+          short_sha="${GITHUB_SHA:0:7}"
+          title="CI failed on ${short_sha}"
+          existing_issue="$(
+            gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --search "${title} in:title" \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+
+          if [[ -n "$existing_issue" ]]; then
+            exit 0
+          fi
+
+          {
+            echo "The direct-to-main quality goblin rejected commit \`${GITHUB_SHA}\`."
+            echo
+            echo "Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo '```text'
+            tail -c 50000 ci.log
+            echo '```'
+          } > ci-issue.md
+
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$title" \
+            --body-file ci-issue.md
+
+      - name: Fail the workflow when checks failed
+        if: always() && steps.checks.outputs.result != 'success'
+        run: exit 1
