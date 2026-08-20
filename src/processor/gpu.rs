@@ -348,7 +348,7 @@ impl GpuProcessor {
             });
             compute_pass.set_pipeline(&self.pipeline);
             compute_pass.set_bind_group(0, &self.bind_group, &[]);
-            let workgroups = (params.request_count + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+            let workgroups = params.request_count.div_ceil(WORKGROUP_SIZE);
             compute_pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
