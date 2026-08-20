@@ -148,9 +148,7 @@ async fn read_raw_request(
 }
 
 fn has_complete_headers(request: &[u8]) -> bool {
-    request
-        .windows(4)
-        .any(|window| window == b"\r\n\r\n")
+    request.windows(4).any(|window| window == b"\r\n\r\n")
 }
 
 async fn write_and_close(stream: &mut TcpStream, response: &[u8]) -> Result<()> {
