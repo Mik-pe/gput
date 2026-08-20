@@ -85,10 +85,14 @@ impl BatcherHandle {
 
         match self.sender.try_send(Job { request, reply }) {
             Ok(()) => {
-                self.metrics.accepted_requests.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .accepted_requests
+                    .fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Full(_)) => {
-                self.metrics.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .rejected_requests
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(SubmitError::Overloaded);
             }
             Err(TrySendError::Disconnected(_)) => return Err(SubmitError::Stopped),
@@ -147,7 +151,9 @@ fn worker_loop(
 
         let batch_size = jobs.len();
         metrics.batches.fetch_add(1, Ordering::Relaxed);
-        metrics.max_batch_seen.fetch_max(batch_size, Ordering::Relaxed);
+        metrics
+            .max_batch_seen
+            .fetch_max(batch_size, Ordering::Relaxed);
 
         let processing_started = Instant::now();
         let result = {
@@ -158,10 +164,9 @@ fn worker_loop(
             processor.process_batch(&requests)
         };
         let processing_elapsed = processing_started.elapsed();
-        metrics.total_processing_nanos.fetch_add(
-            duration_as_u64_nanos(processing_elapsed),
-            Ordering::Relaxed,
-        );
+        metrics
+            .total_processing_nanos
+            .fetch_add(duration_as_u64_nanos(processing_elapsed), Ordering::Relaxed);
 
         debug!(
             backend = processor.name(),
@@ -233,7 +238,8 @@ mod tests {
         }
 
         fn process_batch(&mut self, requests: &[&[u8]]) -> Result<Vec<Vec<u8>>> {
-            self.max_batch_seen.fetch_max(requests.len(), Ordering::Relaxed);
+            self.max_batch_seen
+                .fetch_max(requests.len(), Ordering::Relaxed);
             Ok(requests.iter().map(|request| request.to_vec()).collect())
         }
     }
