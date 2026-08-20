@@ -15,9 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Run the whole Rust gauntlet
+      - name: Run the whole Rust and GPU gauntlet
         id: checks
         continue-on-error: true
         shell: bash
@@ -38,6 +38,16 @@ jobs:
             return "$status"
           }
 
+          ensure_lavapipe() {
+            if find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit \
+              2>/dev/null | grep --quiet .; then
+              return 0
+            fi
+
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends mesa-vulkan-drivers
+          }
+
           run_check "install Rust 1.97.1" \
             rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           setup_status=$?
@@ -49,8 +59,42 @@ jobs:
               cargo +1.97.1 clippy --all-targets --all-features -- -D warnings
             run_check "cargo test" \
               cargo +1.97.1 test --all-features
+            run_check "cargo build" \
+              cargo +1.97.1 build --bin gput
+            build_status=$?
+
+            if (( build_status == 0 )); then
+              run_check "CPU socket smoke test" \
+                env GPUT_SMOKE_PORT=18080 \
+                bash scripts/smoke.sh cpu target/debug/gput
+
+              run_check "install or locate Lavapipe" ensure_lavapipe
+              lavapipe_status=$?
+
+              if (( lavapipe_status == 0 )); then
+                lvp_icd="$(
+                  find /usr/share/vulkan/icd.d -maxdepth 1 \
+                    -name 'lvp_icd*.json' -print -quit
+                )"
+                runtime_dir="$(mktemp -d)"
+                chmod 700 "$runtime_dir"
+
+                run_check "GPU socket smoke test through Lavapipe" \
+                  env \
+                    GPUT_SMOKE_PORT=18081 \
+                    WGPU_BACKEND=vulkan \
+                    VK_DRIVER_FILES="$lvp_icd" \
+                    VK_ICD_FILENAMES="$lvp_icd" \
+                    XDG_RUNTIME_DIR="$runtime_dir" \
+                    LIBGL_ALWAYS_SOFTWARE=true \
+                    GALLIUM_DRIVER=llvmpipe \
+                  bash scripts/smoke.sh gpu target/debug/gput
+
+                rm -rf "$runtime_dir"
+              fi
+            fi
           else
-            printf '\nRust setup failed; cargo checks were skipped.\n' | tee -a ci.log
+            printf '\nRust setup failed; cargo and smoke checks were skipped.\n' | tee -a ci.log
           fi
 
           if (( failed == 0 )); then
@@ -58,6 +102,16 @@ jobs:
           else
             echo "result=failure" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Preserve generated Cargo.lock
+        if: always() && hashFiles('Cargo.lock') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock-${{ github.sha }}
+          path: Cargo.lock
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
 
       - name: Publish commit status
         if: always()
@@ -69,9 +123,9 @@ jobs:
           state="$CHECK_RESULT"
           if [[ "$state" != "success" ]]; then
             state="failure"
-            description="format, clippy, or tests failed"
+            description="Rust, protocol, or GPU smoke checks failed"
           else
-            description="format, clippy, and tests passed"
+            description="format, Clippy, tests, and CPU/GPU smoke passed"
           fi
 
           gh api --method POST \
@@ -117,6 +171,25 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$title" \
             --body-file ci-issue.md
+
+      - name: Close superseded failure-log issues
+        if: always() && steps.checks.outputs.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --search 'CI failed on in:title' \
+            --json number \
+            --jq '.[].number' |
+          while read -r issue_number; do
+            [[ -z "$issue_number" ]] && continue
+            gh issue close "$issue_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --comment "Superseded by green CI on \`${GITHUB_SHA}\`."
+          done
 
       - name: Fail the workflow when checks failed
         if: always() && steps.checks.outputs.result != 'success'
