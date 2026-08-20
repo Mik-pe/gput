@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -420,7 +420,8 @@ mod tests {
 
     #[test]
     fn rejects_a_content_length_lie() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 9000\r\nX-Gput-Backend: cpu\r\n\r\nok\n";
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9000\r\nX-Gput-Backend: cpu\r\n\r\nok\n";
 
         assert!(validate_response(response, Some("cpu")).is_err());
     }
