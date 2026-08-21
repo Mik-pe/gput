@@ -56,6 +56,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           shader = Path("src/processor/http.wgsl")
           source = shader.read_text()
@@ -63,7 +64,11 @@ jobs:
           after = """    writer_push_string(&writer, STRING_HTTP_VERSION);\n    writer_push_decimal(&writer, status);\n    writer_push_byte(&writer, 32u);\n    writer_push_string(&writer, reason_string_id);\n"""
           if before not in source:
               raise SystemExit("expected shader status-line block was not found")
-          shader.write_text(source.replace(before, after, 1))
+          source = source.replace(before, after, 1)
+          source, renamed_targets = re.subn(r"\btarget\b", "request_target", source)
+          if renamed_targets == 0:
+              raise SystemExit("expected reserved WGSL target identifiers were not found")
+          shader.write_text(source)
 
           router = Path("src/router.rs")
           source = router.read_text()
