@@ -1,10 +1,17 @@
 # Benchmarking gput without lying to ourselves
 
-`gput-bench` is both a quick local load generator and a neutral little referee that can point at another HTTP server. The interesting number is not the luckiest run. The suite reports the median across repeats and sweeps persistent HTTP/1.1 connections across several concurrency levels.
+`gput` now has two separate benchmark arenas. Keep them separate because they answer different questions.
 
-The `gput` binary exposes `/plaintext` with the body `Hello, World!` specifically so boring HTTP throughput can be measured before reaching for workloads that flatter the GPU.
+- `gput-bench` measures real HTTP clients against a listening server.
+- `gput-packet-bench` feeds identical raw IPv4/TCP packets to a single-threaded CPU reference and the GPU packet engine.
 
-## Start gput
+The interesting number is not the luckiest run. Warm up first, repeat the measurement, publish latency beside throughput, and include the machine configuration.
+
+## Socket-level HTTP benchmark
+
+The `gput` binary exposes `/plaintext` with exactly `Hello, World!` so transport and dispatch overhead can be measured before selecting work that flatters the GPU.
+
+Start gput:
 
 ```bash
 cargo run --release --locked -- \
@@ -14,21 +21,7 @@ cargo run --release --locked -- \
   --batch-wait-micros 50
 ```
 
-## One measurement
-
-```bash
-cargo run --release --locked --bin gput-bench -- \
-  --address 127.0.0.1:8080 \
-  --path /plaintext \
-  --requests 100000 \
-  --concurrency 256 \
-  --pipeline 1 \
-  --expected-backend gpu
-```
-
-The client keeps one TCP connection per worker alive for the phase. `--pipeline N` writes up to `N` requests before reading the corresponding responses, preserving response order and measuring latency from the start of each pipeline burst.
-
-## The useful command
+Run the concurrency sweep:
 
 ```bash
 cargo run --release --locked --bin gput-bench -- suite \
@@ -42,11 +35,11 @@ cargo run --release --locked --bin gput-bench -- suite \
   --expected-backend gpu
 ```
 
-This prints median requests/second, best requests/second, and median p99 latency for each concurrency level. JSON output is available with `--json`.
+This reports median requests/second, best requests/second and median p99 latency for each concurrency level. JSON output is available with `--json`.
 
-## Smack another server with the same ruler
+### Smack another server with the same ruler
 
-Run the competitor on another port with a `GET /plaintext` endpoint that returns a fixed body and a correct `Content-Length`, then point the exact same client at it:
+Run a competitor on another port with the same `/plaintext` body and a correct `Content-Length`, then point the exact same client at it:
 
 ```bash
 cargo run --release --locked --bin gput-bench -- suite \
@@ -59,10 +52,78 @@ cargo run --release --locked --bin gput-bench -- suite \
   --label axum
 ```
 
-Do not pass `--expected-backend` for non-gput servers. Keep the machine, request count, concurrency sweep, pipeline depth, CPU affinity, power profile, and background load identical between contestants.
+Do not pass `--expected-backend` for non-gput servers. Keep request count, concurrency, pipeline depth, CPU affinity, power profile and background load identical. Corroborate public claims with an independent generator such as `wrk` or `oha`.
 
-For public bragging rights, corroborate the result with an independent load generator such as `wrk` or `oha`. `gput-bench` is intentionally dependency-light and excellent for repeatable repo-local comparisons, but the defendant should not also be the only judge.
+## Raw-packet CPU versus GPU benchmark
 
-## What the suite is trying to reveal
+The packet benchmark removes the kernel server socket from the measured engine and exercises the same packet-level state machine on both backends:
 
-Plaintext answers whether the network/framing/GPU round trip is competitive at all. Then point the suite at `/hello`, `/utf8`, or `/inspect?owl=bench` to see how the crossover moves as response work becomes more interesting. A future GPU-native hashing, vector, image, or inference endpoint should use the same harness rather than inventing a friendlier benchmark.
+```bash
+cargo run --release --locked --bin gput-packet-bench -- \
+  --backend both \
+  --flows 4096 \
+  --requests-per-flow 1000 \
+  --warmup-requests-per-flow 20 \
+  --batch-size 256 \
+  --flow-capacity 16384 \
+  --flow-probe-limit 64
+```
+
+Every flow performs a raw SYN handshake, repeated persistent `/plaintext` exchanges and FIN cleanup. Every emitted IPv4/TCP checksum, sequence number, acknowledgement, status and body is validated outside the timed engine section.
+
+The CPU reference is deliberately straightforward and single-threaded. It exists to answer the crossover question for this exact state machine. It is not a substitute for comparisons against an optimized kernel stack, DPDK, AF_XDP or a production framework.
+
+The report includes:
+
+- engine requests/s
+- full harness requests/s
+- represented wire packets/s
+- response MiB/s
+- p50 and p99 batch-round latency
+- packets per GPU dispatch
+- handshake flows/s
+- adapter name
+- GPU-to-CPU-reference ratio when both are run
+
+Use `--json` for machine-readable results.
+
+## Benchmark the real TUN path
+
+Start `gput-packetd`, then point `gput-bench` at the virtual peer with pipeline depth one:
+
+```bash
+sudo ./target/release/gput-packetd \
+  --local 10.77.0.1 \
+  --peer 10.77.0.2 \
+  --listen-port 8080 \
+  --gpu-batch-capacity 256 \
+  --batch-wait-micros 50
+```
+
+```bash
+cargo run --release --locked --bin gput-bench -- \
+  --address 10.77.0.2:8080 \
+  --path /plaintext \
+  --requests 100000 \
+  --concurrency 256 \
+  --pipeline 1
+```
+
+The packet fast path currently accepts one HTTP request per in-order TCP payload segment. Keep `--pipeline 1` until stream reassembly can split several pipelined requests carried by the same segment.
+
+## Evidence checklist
+
+For a result worth putting in a README, record:
+
+- exact commit
+- command line and all environment variables
+- CPU and GPU model
+- GPU driver and backend
+- operating system and kernel
+- power/performance mode
+- CPU affinity and core count available to each process
+- whether load generation shared the server machine
+- all repeated runs, not only the peak
+- throughput and p99 latency
+
+See [docs/PROOF.md](docs/PROOF.md) for the correctness and portability proof pyramid. The goal is to find where the curves cross, not to invent a workload where the answer was decided before the benchmark started.

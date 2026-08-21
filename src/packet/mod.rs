@@ -1,16 +1,43 @@
-use std::fmt::Write as _;
+mod cpu;
+mod wire;
+
+pub use cpu::CpuPacketEngine;
+pub use wire::{
+    FlowKey, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpPacketSpec, TcpPacketView,
+    build_ipv4_tcp_packet, flow_hash, parse_ipv4_tcp, validate_ipv4_tcp_checksums,
+};
+
+use std::{
+    collections::HashSet,
+    fmt::Write as _,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::{Context, Result, ensure};
 use bytemuck::{Pod, Zeroable};
 
 pub const MAX_RAW_PACKET_BYTES: usize = 1536;
 
-const PACKET_WORDS: usize = MAX_RAW_PACKET_BYTES / 4;
-const FLOW_WORDS: usize = 8;
+const PACKET_WORDS: usize = MAX_RAW_PACKET_BYTES.div_ceil(4);
+const FLOW_WORDS: usize = 16;
 const DEFAULT_FLOW_CAPACITY: usize = 4096;
+const DEFAULT_FLOW_PROBE_LIMIT: usize = 32;
 const WORKGROUP_SIZE: usize = 64;
 const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 5;
-const PACKET_HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 14\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nHello, World!\n";
+
+const RESPONSE_PLAINTEXT: u32 = 0;
+const RESPONSE_HEALTH: u32 = 1;
+const RESPONSE_BAD_REQUEST: u32 = 2;
+const RESPONSE_NOT_FOUND: u32 = 3;
+const RESPONSE_METHOD_NOT_ALLOWED: u32 = 4;
+
+const PACKET_RESPONSES: [&[u8]; 5] = [
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 14\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nHello, World!\n",
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 3\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nok\n",
+    b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nbad request\n",
+    b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 10\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nnot found\n",
+    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nmethod not allowed\n",
+];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -26,6 +53,8 @@ struct EngineParams {
     packet_stride_words: u32,
     flow_capacity: u32,
     listen_port: u32,
+    flow_probe_limit: u32,
+    _padding: [u32; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,14 +83,35 @@ impl RawPacket {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PacketEngineMetrics {
+    pub dispatches: u64,
+    pub packets: u64,
+}
+
+impl PacketEngineMetrics {
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            dispatches: self.dispatches.saturating_sub(earlier.dispatches),
+            packets: self.packets.saturating_sub(earlier.packets),
+        }
+    }
+}
+
 pub trait PacketEngine {
+    fn name(&self) -> &'static str;
     fn process_batch(&self, packets: &[RawPacket]) -> Result<Vec<Option<RawPacket>>>;
+
+    fn metrics(&self) -> PacketEngineMetrics {
+        PacketEngineMetrics::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct PacketEngineConfig {
     pub max_batch_size: usize,
     pub flow_capacity: usize,
+    pub flow_probe_limit: usize,
     pub listen_port: u16,
 }
 
@@ -70,6 +120,7 @@ impl Default for PacketEngineConfig {
         Self {
             max_batch_size: 256,
             flow_capacity: DEFAULT_FLOW_CAPACITY,
+            flow_probe_limit: DEFAULT_FLOW_PROBE_LIMIT,
             listen_port: 8080,
         }
     }
@@ -85,30 +136,24 @@ pub struct GpuPacketEngine {
     input_words: wgpu::Buffer,
     output_meta: wgpu::Buffer,
     output_words: wgpu::Buffer,
+    _flow_state: wgpu::Buffer,
     readback_meta: wgpu::Buffer,
     readback_words: wgpu::Buffer,
     params: wgpu::Buffer,
     config: PacketEngineConfig,
+    adapter_name: String,
+    dispatches: AtomicU64,
+    packets: AtomicU64,
 }
 
 impl GpuPacketEngine {
     pub fn new(config: PacketEngineConfig) -> Result<Self> {
-        ensure!(config.max_batch_size > 0, "max batch size must be positive");
-        ensure!(config.flow_capacity > 0, "flow capacity must be positive");
-        ensure!(
-            config.flow_capacity.is_power_of_two(),
-            "flow capacity must be a power of two"
-        );
-        ensure!(
-            config.max_batch_size <= u32::MAX as usize,
-            "max batch size must fit u32"
-        );
-        ensure!(
-            config.flow_capacity <= u32::MAX as usize,
-            "flow capacity must fit u32"
-        );
-
+        validate_config(config)?;
         pollster::block_on(Self::new_async(config))
+    }
+
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
     }
 
     async fn new_async(config: PacketEngineConfig) -> Result<Self> {
@@ -163,10 +208,12 @@ impl GpuPacketEngine {
             .checked_mul(PACKET_WORDS)
             .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
             .context("packet word buffer size overflow")?;
-        let flow_bytes = config
+        let flow_words = config
             .flow_capacity
             .checked_mul(FLOW_WORDS)
-            .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+            .context("flow word count overflow")?;
+        let flow_bytes = flow_words
+            .checked_mul(std::mem::size_of::<u32>())
             .context("flow buffer size overflow")?;
 
         let input_meta = storage_buffer(&device, "packet input metadata", packet_meta_bytes, false);
@@ -186,6 +233,7 @@ impl GpuPacketEngine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        queue.write_buffer(&flow_state, 0, bytemuck::cast_slice(&vec![0_u32; flow_words]));
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("packet engine bind group layout"),
@@ -239,8 +287,9 @@ impl GpuPacketEngine {
             device_type = ?adapter_info.device_type,
             max_batch_size = config.max_batch_size,
             flow_capacity = config.flow_capacity,
+            flow_probe_limit = config.flow_probe_limit,
             listen_port = config.listen_port,
-            "using GPU-native packet engine"
+            "using collision-safe GPU-native packet engine"
         );
 
         Ok(Self {
@@ -253,28 +302,24 @@ impl GpuPacketEngine {
             input_words,
             output_meta,
             output_words,
+            _flow_state: flow_state,
             readback_meta,
             readback_words,
             params,
             config,
+            adapter_name: adapter_info.name,
+            dispatches: AtomicU64::new(0),
+            packets: AtomicU64::new(0),
         })
     }
-}
 
-impl PacketEngine for GpuPacketEngine {
-    fn process_batch(&self, packets: &[RawPacket]) -> Result<Vec<Option<RawPacket>>> {
-        ensure!(
-            packets.len() <= self.config.max_batch_size,
-            "packet batch has {} items; maximum is {}",
-            packets.len(),
-            self.config.max_batch_size
-        );
+    fn dispatch_wave(&self, packets: &[&RawPacket]) -> Result<Vec<Option<RawPacket>>> {
         if packets.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut metadata = vec![PacketMeta::zeroed(); self.config.max_batch_size];
-        let mut words = vec![0_u32; self.config.max_batch_size * PACKET_WORDS];
+        let packet_count = packets.len();
+        let mut metadata = vec![PacketMeta::zeroed(); packet_count];
+        let mut words = vec![0_u32; packet_count * PACKET_WORDS];
         for (packet_index, packet) in packets.iter().enumerate() {
             metadata[packet_index].len = packet.bytes.len() as u32;
             let base = packet_index * PACKET_WORDS;
@@ -282,10 +327,12 @@ impl PacketEngine for GpuPacketEngine {
         }
 
         let params = EngineParams {
-            packet_count: packets.len() as u32,
+            packet_count: packet_count as u32,
             packet_stride_words: PACKET_WORDS as u32,
             flow_capacity: self.config.flow_capacity as u32,
             listen_port: self.config.listen_port.into(),
+            flow_probe_limit: self.config.flow_probe_limit as u32,
+            _padding: [0; 3],
         };
         self.queue
             .write_buffer(&self.input_meta, 0, bytemuck::cast_slice(&metadata));
@@ -294,6 +341,10 @@ impl PacketEngine for GpuPacketEngine {
         self.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
 
+        let meta_copy_bytes =
+            (packet_count * std::mem::size_of::<PacketMeta>()) as u64;
+        let word_copy_bytes =
+            (packet_count * PACKET_WORDS * std::mem::size_of::<u32>()) as u64;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -306,31 +357,31 @@ impl PacketEngine for GpuPacketEngine {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(packets.len().div_ceil(WORKGROUP_SIZE) as u32, 1, 1);
+            pass.dispatch_workgroups(packet_count.div_ceil(WORKGROUP_SIZE) as u32, 1, 1);
         }
         encoder.copy_buffer_to_buffer(
             &self.output_meta,
             0,
             &self.readback_meta,
             0,
-            (self.config.max_batch_size * std::mem::size_of::<PacketMeta>()) as u64,
+            meta_copy_bytes,
         );
         encoder.copy_buffer_to_buffer(
             &self.output_words,
             0,
             &self.readback_words,
             0,
-            (self.config.max_batch_size * PACKET_WORDS * std::mem::size_of::<u32>()) as u64,
+            word_copy_bytes,
         );
         self.queue.submit(Some(encoder.finish()));
 
-        let meta_bytes = map_read(&self.device, &self.readback_meta)?;
-        let word_bytes = map_read(&self.device, &self.readback_words)?;
+        let meta_bytes = map_read(&self.device, &self.readback_meta, meta_copy_bytes)?;
+        let word_bytes = map_read(&self.device, &self.readback_words, word_copy_bytes)?;
         let output_meta: &[PacketMeta] = bytemuck::cast_slice(&meta_bytes);
         let output_words: &[u32] = bytemuck::cast_slice(&word_bytes);
-        let mut output = Vec::with_capacity(packets.len());
+        let mut output = Vec::with_capacity(packet_count);
 
-        for (index, meta) in output_meta.iter().take(packets.len()).enumerate() {
+        for (index, meta) in output_meta.iter().enumerate() {
             let len = meta.len as usize;
             if len == 0 {
                 output.push(None);
@@ -351,21 +402,180 @@ impl PacketEngine for GpuPacketEngine {
         drop(meta_bytes);
         self.readback_words.unmap();
         self.readback_meta.unmap();
+        self.dispatches.fetch_add(1, Ordering::Relaxed);
+        self.packets
+            .fetch_add(packet_count as u64, Ordering::Relaxed);
         Ok(output)
     }
 }
 
+impl PacketEngine for GpuPacketEngine {
+    fn name(&self) -> &'static str {
+        "gpu-packet"
+    }
+
+    fn process_batch(&self, packets: &[RawPacket]) -> Result<Vec<Option<RawPacket>>> {
+        if packets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let waves = schedule_waves(packets, self.config.max_batch_size);
+        let mut output = vec![None; packets.len()];
+        for wave in waves {
+            let inputs = wave.iter().map(|index| &packets[*index]).collect::<Vec<_>>();
+            let wave_output = self.dispatch_wave(&inputs)?;
+            for (index, packet) in wave.into_iter().zip(wave_output) {
+                output[index] = packet;
+            }
+        }
+        Ok(output)
+    }
+
+    fn metrics(&self) -> PacketEngineMetrics {
+        PacketEngineMetrics {
+            dispatches: self.dispatches.load(Ordering::Relaxed),
+            packets: self.packets.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub(crate) fn validate_config(config: PacketEngineConfig) -> Result<()> {
+    ensure!(config.max_batch_size > 0, "max batch size must be positive");
+    ensure!(config.flow_capacity > 0, "flow capacity must be positive");
+    ensure!(
+        config.flow_capacity.is_power_of_two(),
+        "flow capacity must be a power of two"
+    );
+    ensure!(config.flow_probe_limit > 0, "flow probe limit must be positive");
+    ensure!(
+        config.flow_probe_limit <= config.flow_capacity,
+        "flow probe limit must not exceed flow capacity"
+    );
+    ensure!(
+        config.max_batch_size <= u32::MAX as usize,
+        "max batch size must fit u32"
+    );
+    ensure!(
+        config.flow_capacity <= u32::MAX as usize,
+        "flow capacity must fit u32"
+    );
+    let largest_response = PACKET_RESPONSES
+        .iter()
+        .map(|response| response.len())
+        .max()
+        .expect("packet response table is non-empty");
+    ensure!(
+        40 + largest_response <= MAX_RAW_PACKET_BYTES,
+        "largest packet response does not fit the raw packet slot"
+    );
+    Ok(())
+}
+
+pub(crate) fn classify_http_request(payload: &[u8]) -> u32 {
+    let Some(line_end) = payload.windows(2).position(|window| window == b"\r\n") else {
+        return RESPONSE_BAD_REQUEST;
+    };
+    let line = &payload[..line_end];
+    let mut parts = line.split(|byte| *byte == b' ');
+    let Some(method) = parts.next() else {
+        return RESPONSE_BAD_REQUEST;
+    };
+    let Some(target) = parts.next() else {
+        return RESPONSE_BAD_REQUEST;
+    };
+    let Some(version) = parts.next() else {
+        return RESPONSE_BAD_REQUEST;
+    };
+    if parts.next().is_some()
+        || target.is_empty()
+        || (version != b"HTTP/1.1" && version != b"HTTP/1.0")
+    {
+        return RESPONSE_BAD_REQUEST;
+    }
+    if method != b"GET" {
+        return RESPONSE_METHOD_NOT_ALLOWED;
+    }
+    let path = target
+        .split(|byte| *byte == b'?')
+        .next()
+        .unwrap_or(target);
+    match path {
+        b"/plaintext" => RESPONSE_PLAINTEXT,
+        b"/health" => RESPONSE_HEALTH,
+        _ => RESPONSE_NOT_FOUND,
+    }
+}
+
+pub(crate) fn packet_response(response_id: u32) -> &'static [u8] {
+    PACKET_RESPONSES
+        .get(response_id as usize)
+        .copied()
+        .unwrap_or(PACKET_RESPONSES[RESPONSE_BAD_REQUEST as usize])
+}
+
+fn schedule_waves(packets: &[RawPacket], max_batch_size: usize) -> Vec<Vec<usize>> {
+    let keys = packets
+        .iter()
+        .map(|packet| parse_ipv4_tcp(packet).map(|tcp| tcp.key))
+        .collect::<Vec<_>>();
+    let mut pending = (0..packets.len()).collect::<Vec<_>>();
+    let mut waves = Vec::new();
+
+    while !pending.is_empty() {
+        let mut seen = HashSet::new();
+        let mut wave = Vec::with_capacity(max_batch_size.min(pending.len()));
+        let mut next = Vec::new();
+        for index in pending {
+            if wave.len() == max_batch_size {
+                next.push(index);
+                continue;
+            }
+            if let Some(key) = keys[index]
+                && !seen.insert(key)
+            {
+                next.push(index);
+                continue;
+            }
+            wave.push(index);
+        }
+        waves.push(wave);
+        pending = next;
+    }
+    waves
+}
+
 fn packet_shader_source() -> Result<String> {
-    let words = pack_bytes(PACKET_HTTP_RESPONSE);
+    let mut response_bytes = Vec::new();
+    let mut response_offsets = Vec::with_capacity(PACKET_RESPONSES.len());
+    let mut response_lengths = Vec::with_capacity(PACKET_RESPONSES.len());
+    for response in PACKET_RESPONSES {
+        response_offsets.push(response_bytes.len() as u32);
+        response_lengths.push(response.len() as u32);
+        response_bytes.extend_from_slice(response);
+    }
+    let words = pack_bytes(&response_bytes);
     let mut source = String::new();
+    writeln!(source, "const FLOW_WORDS: u32 = {FLOW_WORDS}u;")?;
     writeln!(
         source,
-        "const HTTP_RESPONSE_LEN: u32 = {}u;",
-        PACKET_HTTP_RESPONSE.len()
+        "const RESPONSE_COUNT: u32 = {}u;",
+        PACKET_RESPONSES.len()
     )?;
+    writeln!(source, "const RESPONSE_PLAINTEXT: u32 = {RESPONSE_PLAINTEXT}u;")?;
+    writeln!(source, "const RESPONSE_HEALTH: u32 = {RESPONSE_HEALTH}u;")?;
     writeln!(
         source,
-        "const HTTP_RESPONSE_WORDS: array<u32, {}> = array<u32, {}>(",
+        "const RESPONSE_BAD_REQUEST: u32 = {RESPONSE_BAD_REQUEST}u;"
+    )?;
+    writeln!(source, "const RESPONSE_NOT_FOUND: u32 = {RESPONSE_NOT_FOUND}u;")?;
+    writeln!(
+        source,
+        "const RESPONSE_METHOD_NOT_ALLOWED: u32 = {RESPONSE_METHOD_NOT_ALLOWED}u;"
+    )?;
+    write_u32_array(&mut source, "RESPONSE_OFFSETS", &response_offsets)?;
+    write_u32_array(&mut source, "RESPONSE_LENGTHS", &response_lengths)?;
+    writeln!(
+        source,
+        "const RESPONSE_WORDS: array<u32, {}> = array<u32, {}>(",
         words.len(),
         words.len()
     )?;
@@ -378,6 +588,20 @@ fn packet_shader_source() -> Result<String> {
     source.push_str(");\n");
     source.push_str(include_str!("packet.wgsl"));
     Ok(source)
+}
+
+fn write_u32_array(source: &mut String, name: &str, values: &[u32]) -> Result<()> {
+    writeln!(
+        source,
+        "const {name}: array<u32, {}> = array<u32, {}>(",
+        values.len(),
+        values.len()
+    )?;
+    for value in values {
+        write!(source, "{value}u,")?;
+    }
+    source.push_str(");\n");
+    Ok(())
 }
 
 fn storage_buffer(
@@ -420,8 +644,12 @@ fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_>
     }
 }
 
-fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<wgpu::BufferView> {
-    let slice = buffer.slice(..);
+fn map_read(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    size: u64,
+) -> Result<wgpu::BufferView> {
+    let slice = buffer.slice(0..size);
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
@@ -480,22 +708,72 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_packet_response_has_an_honest_content_length() {
-        let separator = PACKET_HTTP_RESPONSE
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("HTTP response has header separator");
-        let headers = std::str::from_utf8(&PACKET_HTTP_RESPONSE[..separator])
-            .expect("response headers are ASCII");
-        let body = &PACKET_HTTP_RESPONSE[separator + 4..];
-        let content_length = headers
-            .lines()
-            .find_map(|line| line.strip_prefix("Content-Length: "))
-            .expect("response has content length")
-            .parse::<usize>()
-            .expect("content length is numeric");
+    fn every_packet_response_has_an_honest_content_length() {
+        for response in PACKET_RESPONSES {
+            let separator = response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("HTTP response has header separator");
+            let headers =
+                std::str::from_utf8(&response[..separator]).expect("response headers are ASCII");
+            let body = &response[separator + 4..];
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .expect("response has content length")
+                .parse::<usize>()
+                .expect("content length is numeric");
+            assert_eq!(content_length, body.len());
+        }
+    }
 
-        assert_eq!(content_length, body.len());
-        assert_eq!(body, b"Hello, World!\n");
+    #[test]
+    fn scheduler_keeps_same_flow_in_order_across_dispatches() {
+        let key = FlowKey {
+            src_ip: 1,
+            dst_ip: 2,
+            src_port: 3,
+            dst_port: 4,
+        };
+        let other = FlowKey {
+            src_port: 5,
+            ..key
+        };
+        let packets = [key, key, other]
+            .map(|key| {
+                build_ipv4_tcp_packet(TcpPacketSpec {
+                    key,
+                    seq: 1,
+                    ack: 0,
+                    flags: TCP_SYN,
+                    payload: &[],
+                })
+                .expect("packet builds")
+            })
+            .to_vec();
+        let waves = schedule_waves(&packets, 8);
+
+        assert_eq!(waves, vec![vec![0, 2], vec![1]]);
+    }
+
+    #[test]
+    fn CPU_request_classifier_matches_packet_routes() {
+        assert_eq!(
+            classify_http_request(b"GET /plaintext?owl=yes HTTP/1.1\r\n\r\n"),
+            RESPONSE_PLAINTEXT
+        );
+        assert_eq!(
+            classify_http_request(b"GET /health HTTP/1.0\r\n\r\n"),
+            RESPONSE_HEALTH
+        );
+        assert_eq!(
+            classify_http_request(b"GET /missing HTTP/1.1\r\n\r\n"),
+            RESPONSE_NOT_FOUND
+        );
+        assert_eq!(
+            classify_http_request(b"POST /plaintext HTTP/1.1\r\n\r\n"),
+            RESPONSE_METHOD_NOT_ALLOWED
+        );
+        assert_eq!(classify_http_request(b"garbage"), RESPONSE_BAD_REQUEST);
     }
 }
