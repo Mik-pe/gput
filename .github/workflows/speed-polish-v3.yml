@@ -1,4 +1,4 @@
-name: land normalized speed surgery
+name: land indentation-safe speed surgery
 
 on:
   push:
