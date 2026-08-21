@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 jobs:
   packet-bridge:
@@ -14,6 +15,17 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+
+      - name: Mark macOS portability pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=pending \
+            -f context=gput/macos \
+            -f description='checking TUN bridge and packet engine on macOS' \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
       - name: Install Rust 1.97.1
         run: rustup toolchain install 1.97.1 --profile minimal
@@ -26,3 +38,26 @@ jobs:
 
       - name: Validate packet shader semantics without requiring a hosted GPU
         run: cargo +1.97.1 test --locked packet::tests::packet_shader_parses_and_validates
+
+      - name: Mark macOS portability green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=success \
+            -f context=gput/macos \
+            -f description='TUN bridge builds and packet shader validates on macOS' \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Mark macOS portability red
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=failure \
+            -f context=gput/macos \
+            -f description='macOS TUN bridge portability check failed' \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
