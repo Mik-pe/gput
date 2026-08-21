@@ -1,4 +1,4 @@
-name: trigger speed surgery
+name: trigger source-only speed surgery
 
 on:
   push:
