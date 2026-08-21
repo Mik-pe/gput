@@ -12,6 +12,8 @@ old = '''def replace(source: str, old: str, new: str, label: str) -> str:
 '''
 new = '''def normalize_block(block: str) -> str:
     lines = block.lstrip("\\n").splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
     normalized = "\\n".join(
         line[4:] if line.startswith("    ") else line for line in lines
     )
