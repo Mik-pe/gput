@@ -4,13 +4,11 @@
 
 **GPU throughput applied to the least deserving workload imaginable.**
 
-`gput` is an experimental HTTP/1.1 server written in Rust. The CPU accepts TCP connections and batches raw request bytes. A GPU compute shader parses each request line, selects an application route, executes a tiny response program, and writes the complete HTTP response into a storage buffer.
+`gput` is an experimental HTTP/1.1 server written in Rust. The CPU accepts and frames TCP traffic; a GPU compute shader parses request lines, selects application routes, executes tiny response programs, and writes complete HTTP responses into storage buffers.
 
 The name is the union of **GPU** and **throughput**, with enough resemblance to an unfortunate Unix command to be trustworthy.
 
 ## Write a GPU web app without writing WGSL
-
-The public API is deliberately shaped like a small Rust web framework:
 
 ```rust
 use anyhow::Result;
@@ -47,24 +45,25 @@ async fn main() -> Result<()> {
 }
 ```
 
-This is Axum-inspired, not Axum-compatible. The important difference is honesty: `get(...)` does not hide a normal CPU closure behind a GPU-shaped curtain. The builders run once at startup and compile the application into immutable GPU data:
+This is Axum-inspired, not Axum-compatible. The builders run once at startup and compile the application into immutable GPU data:
 
 ```text
 Rust Router
     |
-    +--> exact-path route table: sorted hash, length, path string, response offset
-    +--> response descriptors: status, content type, body program
+    +--> exact-path route table
+    +--> response descriptors
+    +--> bounded body bytecode
     +--> UTF-8 string arena
     |
     v
-storage buffers consumed by the compute shader
+GPU storage buffers
 ```
 
-For every request, the compute shader still performs request parsing, route selection, hash-collision-safe path comparison, response-program execution, header assembly, UTF-8 output, and `Content-Length` formatting. The CPU implementation consumes the same compiled router as a baseline and automatic fallback. There is one application manifest, not two implementations waiting to drift apart.
+For every GPU request the compute shader still performs request-line parsing, route selection, exact collision-safe path comparison, response-program execution, header assembly, UTF-8 output, and `Content-Length` formatting. The CPU implementation consumes the same compiled router as a baseline and fallback.
 
-### Response building blocks
+## Response building blocks
 
-A `Body` is a bounded program rather than a host callback. It can currently append:
+A `Body` is a bounded program rather than a host callback. It can append:
 
 - UTF-8 literals with `.push(...)` or `.literal(...)`
 - the request path with `.path(max_bytes)`
@@ -74,90 +73,66 @@ A `Body` is a bounded program rather than a host callback. It can currently appe
 - the GPU-computed FNV-1a path hash with `.path_hash()`
 - different immutable CPU/GPU literals with `.backend_variant(cpu, gpu)`
 
-Responses support text, JSON, HTML, custom content types, and custom status codes. Every dynamic segment has a declared upper bound, so the router compiler can reject a response slot that is too small before serving traffic instead of discovering the problem through scenic buffer wreckage.
+Responses support text, JSON, HTML, custom content types, and custom status codes. Dynamic segments declare upper bounds so the router compiler can reject an undersized GPU response slot before traffic starts.
 
 ## Data path
 
 ```text
-TCP socket
+persistent TCP connection
     |
+    | HTTP/1.1 framing + pipelined request boundaries
     v
-minimal Rust framing
-    |
-    v
-bounded request batch
+bounded request batches
     |
     v
 wgpu compute dispatch
     |  parse GET /path?query HTTP/1.1
-    |  hash and exactly compare application routes
-    |  interpret the compiled response program
-    |  compose headers and UTF-8 bodies with a shader-side Writer
+    |  route
+    |  execute response bytecode
+    |  build HTTP response
     v
 GPU readback
     |
     v
-TCP socket
+persistent TCP connection
 ```
+
+HTTP/1.1 connections stay open by default. Multiple complete requests already waiting on a socket are preserved rather than discarded, so ordinary keep-alive and HTTP/1.1 pipelining work. HTTP/1.0 and explicit `Connection: close` requests close after their response.
 
 ## What works
 
-- a real TCP listener built on Tokio
+- Tokio TCP listener
+- persistent HTTP/1.1 connections
+- basic HTTP/1.1 pipelining
 - an Axum-style Rust `Router` and `routing::get`
-- one-call application startup through `gput::serve(config, router)`
-- router compilation into a GPU route table, response descriptors, body bytecode, and string arena
-- binary-searched FNV-1a routing with exact path comparison, so a hash collision cannot select the wrong route
+- router compilation into GPU route tables, response descriptors, body bytecode, and a string arena
+- binary-searched FNV-1a routing with exact path comparison
 - bounded dynamic response composition from request path, query, size, hash, and backend
 - headless compute through `wgpu`
 - raw HTTP request-line parsing in WGSL
 - complete HTTP responses generated in WGSL
-- host-built UTF-8 string storage with generated WGSL IDs
-- a bounded shader-side `Writer` with string append, decimal formatting, UTF-8 decoding, and code-point encoding
-- a CPU baseline using the same compiled router, network path, and batching path
-- automatic CPU fallback when no compute-capable adapter is available
+- cursed but bounds-checked shader-side UTF-8 strings
+- CPU baseline using the same compiled router
+- automatic CPU fallback
 - limits for request size, response size, connection count, queue depth, and slow clients
-- a built-in concurrent benchmark client with warmup, backend verification, percentiles, and JSON output
-- unit tests, WGSL parse/validation, CPU socket smoke, and Vulkan compute smoke
+- a persistent concurrent benchmark client with backend verification, percentiles, pipelining, concurrency sweeps, repeated runs, medians, and JSON output
+- CPU socket smoke and Vulkan/Lavapipe GPU smoke
 
-The built-in application contains:
+The `gput` binary exposes:
 
 | Route | Response |
 | --- | --- |
 | `/` | project metadata as JSON |
 | `/health` | `ok` |
-| `/hello` | proof that the response came from the selected processor |
-| `/utf8` | an unnecessarily GPU-generated Swedish, euro-denominated, owl-and-crab UTF-8 payload |
+| `/hello` | proof of the selected processor |
+| `/plaintext` | exactly `Hello, World!` for boring throughput measurements |
+| `/utf8` | an unnecessarily GPU-generated Swedish owl-and-crab UTF-8 payload |
 | `/inspect?anything` | path, query, request size, path hash, and backend assembled by the response program |
 | anything else | `404 Not Found` |
 
-Only `GET` is accepted. Each connection handles one request and closes. That remains deliberate while the GPU data path is being measured.
+Only `GET` is accepted.
 
-## The router compiler
-
-Calling `gput::serve` compiles the `Router` before initializing the processor:
-
-1. Route paths are validated, deduplicated, hashed, and interned.
-2. Status reasons, content types, response literals, and route paths are deduplicated into one UTF-8 arena.
-3. Each response body becomes fixed-width bytecode made from the supported `Body` operations.
-4. The compiler calculates the maximum possible GPU response size, including headers and decimal widths.
-5. The GPU receives the route table, response programs, string metadata, and packed string bytes as read-only storage buffers.
-6. The CPU fallback retains the same compiled representation and interprets the same body operations.
-
-Route declarations are static after startup. Request-derived values remain dynamic and are read directly from the request buffer by the compute shader.
-
-## The cursed string model
-
-WGSL does not provide a string type, so `gput` builds one out of storage buffers and stubbornness:
-
-1. Rust gathers every router string into one tightly packed byte arena.
-2. A parallel metadata table records each string's byte offset, byte length, and Unicode scalar count.
-3. Rust prepends numeric IDs for protocol strings and body opcodes to the WGSL source before shader compilation.
-4. The shader's bounds-checked `Writer` appends arena strings, request ranges, decimal integers, and encoded Unicode code points into each response slot.
-5. Literal response strings are decoded and re-encoded on the GPU, catching truncated sequences, overlong encodings, surrogate code points, and values above `U+10FFFF`.
-
-This is dynamic composition, not a general-purpose GPU heap. The router and string arena are immutable after GPU initialization, every writer has a fixed response-slot capacity, and overflow becomes an explicit shader failure.
-
-## Run the built-in app
+## Run it
 
 ```bash
 cargo run --release --locked -- --backend auto --bind 127.0.0.1:8080
@@ -166,8 +141,7 @@ cargo run --release --locked -- --backend auto --bind 127.0.0.1:8080
 Then:
 
 ```bash
-curl -i http://127.0.0.1:8080/
-curl -i http://127.0.0.1:8080/health
+curl -i http://127.0.0.1:8080/plaintext
 curl -i http://127.0.0.1:8080/hello
 curl -i http://127.0.0.1:8080/utf8
 curl -i 'http://127.0.0.1:8080/inspect?owl=yes'
@@ -196,33 +170,50 @@ cargo run --release --locked -- \
 
 ## Measure the damage
 
-Start the server with either backend, then run the included load generator in another terminal:
+One run:
 
 ```bash
 cargo run --release --locked --bin gput-bench -- \
   --address 127.0.0.1:8080 \
-  --path /hello \
+  --path /plaintext \
   --requests 100000 \
   --concurrency 256 \
-  --warmup 2000 \
+  --pipeline 1 \
   --expected-backend gpu
 ```
 
-It reports elapsed time, requests per second, total response bytes, and p50/p95/p99/max latency. Machine-readable output is available with `--json`:
+The useful mode is the suite:
 
 ```bash
-cargo run --release --locked --bin gput-bench -- \
-  --requests 10000 \
-  --concurrency 128 \
-  --expected-backend cpu \
-  --json
+cargo run --release --locked --bin gput-bench -- suite \
+  --address 127.0.0.1:8080 \
+  --path /plaintext \
+  --requests 100000 \
+  --suite-concurrency 1,16,64,256,1024 \
+  --repeats 5 \
+  --label gput-gpu \
+  --expected-backend gpu
 ```
 
-The benchmark opens one TCP connection per request because that is the server's current contract. It is intended for controlled CPU-versus-GPU comparisons of this repository, not as a replacement for mature HTTP benchmarking tools.
+It reports median and best RPS plus median p99 latency for every concurrency level. `--pipeline N` controls requests written before the matching responses are read. `--json` provides machine-readable output.
+
+The same benchmark can point at another server. Do not pass `--expected-backend` for competitors. That makes it possible to benchmark an Axum, Actix, Hyper, C++, Go, or other `/plaintext` implementation with the same request generator and sweep instead of grading gput with a private ruler.
+
+See [BENCHMARKING.md](BENCHMARKING.md) for the benchmark rules and comparison workflow. Public performance claims should also be corroborated with an independent load generator such as `wrk` or `oha`.
+
+## The cursed string model
+
+WGSL does not provide a string type, so gput builds one out of storage buffers and stubbornness:
+
+1. Rust gathers router strings into one tightly packed byte arena.
+2. A metadata table records byte offset, byte length, and Unicode scalar count.
+3. Rust prepends numeric IDs and bytecode constants to the WGSL source.
+4. The shader's bounds-checked `Writer` appends strings, request ranges, decimal integers, and Unicode code points into response slots.
+5. Literal response strings are decoded and re-encoded on the GPU with malformed UTF-8 rejected.
+
+This is dynamic composition, not a general-purpose GPU heap. The router and string arena are immutable after GPU initialization and every writer has a fixed response-slot capacity.
 
 ## Prove that it breathes
-
-Build both binaries, then exercise the complete TCP path, malformed requests, dynamic response programs, query routing, UTF-8 byte lengths, a concurrent burst, and the built-in benchmark:
 
 ```bash
 cargo build --locked --bins
@@ -230,18 +221,16 @@ bash scripts/smoke.sh cpu target/debug/gput
 bash scripts/smoke.sh gpu target/debug/gput
 ```
 
-The CI GPU smoke forces `wgpu` through Vulkan and Mesa Lavapipe. That executes the real upload, compute dispatch, shader parser/router, response interpreter, UTF-8 writer, readback, and socket response path on a deterministic software Vulkan adapter. It proves the GPU code path works end to end, but it is not a substitute for performance measurements on a discrete AMD, Intel, or NVIDIA GPU.
+The GPU smoke forces `wgpu` through Vulkan and Mesa Lavapipe. That exercises real upload, dispatch, shader parsing/routing, response interpretation, UTF-8 writing, readback, and socket response plumbing. Lavapipe proves correctness, not discrete-GPU performance.
 
-CI runs formatting, Clippy with warnings denied, all tests, both binaries, the CPU smoke suite, and the same smoke and benchmark suite against Vulkan/Lavapipe.
-
-A red direct-to-main build opens an issue containing the failure log. The next green build closes superseded CI failure issues automatically.
+CI runs formatting, Clippy with warnings denied, tests, both binaries, and CPU/GPU socket smoke. A red direct-to-main build opens a failure-log issue; the next green build closes superseded failure issues.
 
 ## Development rule
 
-Work goes directly into `main`. No mandatory branches, no default pull requests, no velvet rope. Commits should still be coherent, tested, and easy to revert. See [`AGENTS.md`](AGENTS.md).
+Work goes directly into `main`. No mandatory branches, no default pull requests, no velvet rope. Commits should still be coherent and easy to revert. See [AGENTS.md](AGENTS.md).
 
 ## Honest limitations
 
-This is not a production web server. It currently has no TLS, keep-alive, request bodies, HTTP/2, HTTP/3, path parameters, middleware, arbitrary headers, mutable GPU string heap, persistent mapped ring buffers, or zero-copy NIC integration. Routes are exact static paths and response programs are intentionally small and bounded.
+This is not a production web server. It currently has no TLS, request bodies, HTTP/2, HTTP/3, path parameters, middleware, arbitrary application headers, mutable GPU string heap, persistent mapped ring buffers, or zero-copy NIC integration. Routes are exact static paths and response programs are intentionally small and bounded.
 
-The next sensible expansion is to add typed GPU-native response operations for work such as hashing, image processing, vector search, or inference without exposing raw WGSL to application authors. Until then, this is a surprisingly ergonomic electrical joke.
+The next useful expansion is typed GPU-native work such as hashing, image processing, vector search, or inference without exposing raw WGSL to application authors. Until then, this is a surprisingly ergonomic electrical joke.
