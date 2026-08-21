@@ -198,10 +198,11 @@ mod tests {
         let assets = build_shader_assets("").expect("assets build");
 
         for (index, definition) in STRING_DEFINITIONS.iter().enumerate() {
-            assert!(assets.source.contains(&format!(
-                "const {}: u32 = {index}u;",
-                definition.wgsl_name
-            )));
+            assert!(
+                assets
+                    .source
+                    .contains(&format!("const {}: u32 = {index}u;", definition.wgsl_name))
+            );
         }
     }
 }

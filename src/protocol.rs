@@ -5,15 +5,13 @@ pub const MAX_GPU_RESPONSE_BYTES: usize = 256;
 const JSON_CONTENT_TYPE: &str = "application/json";
 const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
-pub(crate) const GPU_ROOT_BODY: &str =
-    "{\"name\":\"gput\",\"backend\":\"gpu\",\"message\":\"GET dispatched through a compute shader\"}\n";
+pub(crate) const GPU_ROOT_BODY: &str = "{\"name\":\"gput\",\"backend\":\"gpu\",\"message\":\"GET dispatched through a compute shader\"}\n";
 const CPU_ROOT_BODY: &str =
     "{\"name\":\"gput\",\"backend\":\"cpu\",\"message\":\"GET handled by the CPU baseline\"}\n";
 pub(crate) const HEALTH_BODY: &str = "ok\n";
 pub(crate) const GPU_HELLO_BODY: &str = "hello from a compute shader\n";
 const CPU_HELLO_BODY: &str = "hello from the CPU baseline\n";
-pub(crate) const UTF8_BODY: &str =
-    "räksmörgås kostar €5, hälsar UTF-8-ugglan 🦉🦀\n";
+pub(crate) const UTF8_BODY: &str = "räksmörgås kostar €5, hälsar UTF-8-ugglan 🦉🦀\n";
 pub(crate) const NOT_FOUND_BODY: &str = "not found\n";
 pub(crate) const BAD_REQUEST_BODY: &str = "bad request\n";
 pub(crate) const METHOD_NOT_ALLOWED_BODY: &str = "method not allowed\n";
@@ -54,13 +52,9 @@ pub fn route_request(request: &[u8], backend: &'static str) -> Vec<u8> {
             };
             build_response(200, "OK", TEXT_CONTENT_TYPE, body.as_bytes(), backend)
         }
-        RequestRoute::Utf8 => build_response(
-            200,
-            "OK",
-            TEXT_CONTENT_TYPE,
-            UTF8_BODY.as_bytes(),
-            backend,
-        ),
+        RequestRoute::Utf8 => {
+            build_response(200, "OK", TEXT_CONTENT_TYPE, UTF8_BODY.as_bytes(), backend)
+        }
         RequestRoute::NotFound => build_response(
             404,
             "Not Found",

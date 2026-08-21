@@ -267,12 +267,12 @@ fn decode_utf8_string(string_id: u32, byte_index: u32) -> Utf8Scalar {
 }
 
 fn writer_push_utf8_string(writer: ptr<function, Writer>, string_id: u32) {
-    let meta = string_meta[string_id];
+    let string_info = string_meta[string_id];
     var byte_index = 0u;
     var scalar_count = 0u;
 
     loop {
-        if (byte_index >= meta.byte_len) {
+        if (byte_index >= string_info.byte_len) {
             break;
         }
 
@@ -287,7 +287,7 @@ fn writer_push_utf8_string(writer: ptr<function, Writer>, string_id: u32) {
         scalar_count = scalar_count + 1u;
     }
 
-    if (scalar_count != meta.scalar_len) {
+    if (scalar_count != string_info.scalar_len) {
         writer_fail(writer, RESPONSE_FLAG_INVALID_UTF8);
     }
 }
