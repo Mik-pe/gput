@@ -620,13 +620,22 @@ fn fill_next_wave(
 
 fn packet_shader_source() -> Result<String> {
     let mut response_bytes = Vec::new();
-    let mut response_offsets = Vec::with_capacity(PACKET_RESPONSES.len());
+    let mut response_word_offsets = Vec::with_capacity(PACKET_RESPONSES.len());
+    let mut response_word_counts = Vec::with_capacity(PACKET_RESPONSES.len());
     let mut response_lengths = Vec::with_capacity(PACKET_RESPONSES.len());
+    let mut response_checksum_sums = Vec::with_capacity(PACKET_RESPONSES.len());
+
     for response in PACKET_RESPONSES {
-        response_offsets.push(response_bytes.len() as u32);
+        while !response_bytes.len().is_multiple_of(4) {
+            response_bytes.push(0);
+        }
+        response_word_offsets.push((response_bytes.len() / 4) as u32);
+        response_word_counts.push(response.len().div_ceil(4) as u32);
         response_lengths.push(response.len() as u32);
+        response_checksum_sums.push(internet_checksum_sum(response));
         response_bytes.extend_from_slice(response);
     }
+
     let words = pack_bytes(&response_bytes);
     let mut source = String::new();
     writeln!(source, "const FLOW_WORDS: u32 = {FLOW_WORDS}u;")?;
@@ -652,8 +661,14 @@ fn packet_shader_source() -> Result<String> {
         source,
         "const RESPONSE_METHOD_NOT_ALLOWED: u32 = {RESPONSE_METHOD_NOT_ALLOWED}u;"
     )?;
-    write_u32_array(&mut source, "RESPONSE_OFFSETS", &response_offsets)?;
+    write_u32_array(&mut source, "RESPONSE_WORD_OFFSETS", &response_word_offsets)?;
+    write_u32_array(&mut source, "RESPONSE_WORD_COUNTS", &response_word_counts)?;
     write_u32_array(&mut source, "RESPONSE_LENGTHS", &response_lengths)?;
+    write_u32_array(
+        &mut source,
+        "RESPONSE_CHECKSUM_SUMS",
+        &response_checksum_sums,
+    )?;
     writeln!(
         source,
         "const RESPONSE_WORDS: array<u32, {}> = array<u32, {}>(",
@@ -669,6 +684,17 @@ fn packet_shader_source() -> Result<String> {
     source.push_str(");\n");
     source.push_str(include_str!("packet.wgsl"));
     Ok(source)
+}
+
+fn internet_checksum_sum(bytes: &[u8]) -> u32 {
+    bytes
+        .chunks(2)
+        .map(|chunk| {
+            let high = u16::from(chunk[0]) << 8;
+            let low = chunk.get(1).copied().map(u16::from).unwrap_or(0);
+            u32::from(high | low)
+        })
+        .sum()
 }
 
 fn write_u32_array(source: &mut String, name: &str, values: &[u32]) -> Result<()> {
@@ -766,6 +792,18 @@ mod tests {
         let mut words = [0_u32; INPUT_PACKET_WORDS];
         pack_packet(bytes, &mut words);
         assert_eq!(unpack_packet(&words, bytes.len()), bytes);
+    }
+
+    #[test]
+    fn precomputed_response_checksum_sums_match_the_wire_words() {
+        for response in PACKET_RESPONSES {
+            let expected = response.chunks(2).fold(0_u32, |sum, chunk| {
+                let high = u16::from(chunk[0]) << 8;
+                let low = chunk.get(1).copied().map(u16::from).unwrap_or(0);
+                sum + u32::from(high | low)
+            });
+            assert_eq!(internet_checksum_sum(response), expected);
+        }
     }
 
     #[test]

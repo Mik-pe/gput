@@ -226,7 +226,8 @@ See [the proof contract](docs/PROOF.md) and [benchmark rules](BENCHMARKING.md).
 - atomically claimed, collision-safe GPU flow slots
 - SYN, ACK, persistent sequence state, duplicate SYN/data recovery, FIN, and RST cleanup
 - `/plaintext`, `/health`, `400`, `404`, and `405` on the packet path
-- GPU-generated IPv4 and TCP checksums
+- GPU-generated IPv4 and TCP checksums, with precomputed static payload sums
+- word-packed HTTP response templates copied four bytes at a time instead of knitted byte by byte
 - ordered dispatch waves for packets belonging to the same flow
 - batched TUN ingress with packet/dispatch telemetry
 - CPU packet reference and identical-workload packet benchmark

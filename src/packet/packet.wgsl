@@ -236,7 +236,7 @@ fn ipv4_checksum(packet_index: u32) -> u32 {
     return checksum_fold(sum);
 }
 
-fn tcp_checksum(packet_index: u32, tcp_len: u32) -> u32 {
+fn tcp_checksum(packet_index: u32, tcp_len: u32, response_id: u32) -> u32 {
     var sum = 0u;
     sum += read_output_u16_be(packet_index, 12u);
     sum += read_output_u16_be(packet_index, 14u);
@@ -247,34 +247,34 @@ fn tcp_checksum(packet_index: u32, tcp_len: u32) -> u32 {
 
     var offset = 20u;
     loop {
-        if offset >= 20u + tcp_len {
+        if offset >= 40u {
             break;
         }
         if offset != 36u {
-            var word = read_output_byte(packet_index, offset) << 8u;
-            if offset + 1u < 20u + tcp_len {
-                word |= read_output_byte(packet_index, offset + 1u);
-            }
-            sum += word;
+            sum += read_output_u16_be(packet_index, offset);
         }
         offset += 2u;
+    }
+    if response_id < RESPONSE_COUNT {
+        sum += RESPONSE_CHECKSUM_SUMS[response_id];
     }
     return checksum_fold(sum);
 }
 
-fn clear_output(packet_index: u32, len: u32) {
-    var index = 0u;
+fn clear_output_header(packet_index: u32) {
+    let base = packet_index * params.output_stride_words;
+    var word_index = 0u;
     loop {
-        if index >= len {
+        if word_index >= 10u {
             break;
         }
-        write_byte(packet_index, index, 0u);
-        index += 1u;
+        output_words[base + word_index] = 0u;
+        word_index += 1u;
     }
 }
 
 fn write_ipv4(packet_index: u32, len: u32, src_ip: u32, dst_ip: u32) {
-    clear_output(packet_index, len);
+    clear_output_header(packet_index);
     write_byte(packet_index, 0u, 0x45u);
     write_u16_be(packet_index, 2u, len);
     write_u16_be(packet_index, 6u, 0x4000u);
@@ -301,27 +301,27 @@ fn write_tcp(
     write_u16_be(packet_index, 34u, 65535u);
 }
 
-fn write_checksums(packet_index: u32, tcp_len: u32) {
+fn write_checksums(packet_index: u32, tcp_len: u32, response_id: u32) {
     write_u16_be(packet_index, 10u, ipv4_checksum(packet_index));
-    write_u16_be(packet_index, 36u, tcp_checksum(packet_index, tcp_len));
+    write_u16_be(
+        packet_index,
+        36u,
+        tcp_checksum(packet_index, tcp_len, response_id),
+    );
 }
 
 fn write_http_response(packet_index: u32, response_id: u32) {
-    let offset = RESPONSE_OFFSETS[response_id];
-    let len = RESPONSE_LENGTHS[response_id];
-    var index = 0u;
+    let source_base = RESPONSE_WORD_OFFSETS[response_id];
+    let output_base = packet_index * params.output_stride_words + 10u;
+    let word_count = RESPONSE_WORD_COUNTS[response_id];
+    var word_index = 0u;
     loop {
-        if index >= len {
+        if word_index >= word_count {
             break;
         }
-        let absolute = offset + index;
-        let word = RESPONSE_WORDS[absolute / 4u];
-        write_byte(
-            packet_index,
-            40u + index,
-            (word >> ((absolute & 3u) * 8u)) & 0xffu,
-        );
-        index += 1u;
+        output_words[output_base + word_index] =
+            RESPONSE_WORDS[source_base + word_index];
+        word_index += 1u;
     }
 }
 
@@ -346,7 +346,7 @@ fn emit_packet(
     if response_id < RESPONSE_COUNT {
         write_http_response(packet_index, response_id);
     }
-    write_checksums(packet_index, 20u + payload_len);
+    write_checksums(packet_index, 20u + payload_len, response_id);
     output_meta[packet_index].len = packet_len;
 }
 
