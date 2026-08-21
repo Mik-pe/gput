@@ -1,4 +1,4 @@
-name: trigger borrow-safe speed surgery
+name: trigger scoped-borrow speed surgery
 
 on:
   push:
