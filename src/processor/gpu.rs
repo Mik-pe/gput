@@ -69,8 +69,7 @@ pub struct GpuProcessor {
     _string_meta_buffer: wgpu::Buffer,
     _string_words_buffer: wgpu::Buffer,
     _router_words_buffer: wgpu::Buffer,
-    response_meta_readback: wgpu::Buffer,
-    output_readback: wgpu::Buffer,
+    readback_buffer: wgpu::Buffer,
     router_layout: GpuRouterLayout,
     max_batch_size: usize,
     max_request_bytes: usize,
@@ -95,9 +94,11 @@ impl GpuProcessor {
         limits: ProcessorLimits,
         router: Arc<CompiledRouter>,
     ) -> Result<Self> {
+        router.validate_gpu_response_slot(limits.response_slot_bytes)?;
         let shader_assets = build_shader_assets(SHADER_BODY, router.as_ref())?;
         let request_stride_words = words_for_bytes(limits.max_request_bytes)?;
-        let response_stride_words = words_for_bytes(limits.response_slot_bytes)?;
+        let configured_response_stride_words = words_for_bytes(limits.response_slot_bytes)?;
+        let response_stride_words = words_for_bytes(router.max_gpu_response_bytes())?;
         let request_meta_bytes = checked_buffer_bytes(
             "request metadata",
             limits.max_batch_size,
@@ -118,6 +119,9 @@ impl GpuProcessor {
             limits.max_batch_size,
             response_stride_words * size_of::<u32>(),
         )?;
+        let readback_bytes = response_meta_bytes
+            .checked_add(output_bytes)
+            .context("combined HTTP readback size overflow")?;
         let string_meta_bytes = checked_buffer_bytes(
             "shader string metadata",
             shader_assets.metadata.len(),
@@ -291,16 +295,10 @@ impl GpuProcessor {
             router_words_bytes,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
-        let response_meta_readback = create_buffer(
+        let readback_buffer = create_buffer(
             &device,
-            "gput-response-meta-readback",
-            response_meta_bytes,
-            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        );
-        let output_readback = create_buffer(
-            &device,
-            "gput-output-readback",
-            output_bytes,
+            "gput-combined-readback",
+            readback_bytes,
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         );
 
@@ -366,6 +364,7 @@ impl GpuProcessor {
             device_type = ?adapter_info.device_type,
             max_batch_size = limits.max_batch_size,
             request_slot_bytes = request_stride_words * size_of::<u32>(),
+            configured_response_slot_bytes = configured_response_stride_words * size_of::<u32>(),
             response_slot_bytes = response_stride_words * size_of::<u32>(),
             max_router_response_bytes = router.max_gpu_response_bytes(),
             routes = router_layout.route_count,
@@ -389,8 +388,7 @@ impl GpuProcessor {
             _string_meta_buffer: string_meta_buffer,
             _string_words_buffer: string_words_buffer,
             _router_words_buffer: router_words_buffer,
-            response_meta_readback,
-            output_readback,
+            readback_buffer,
             router_layout,
             max_batch_size: limits.max_batch_size,
             max_request_bytes: limits.max_request_bytes,
@@ -496,15 +494,15 @@ impl GpuProcessor {
         encoder.copy_buffer_to_buffer(
             &self.response_meta_buffer,
             0,
-            &self.response_meta_readback,
+            &self.readback_buffer,
             0,
             response_meta_copy_bytes,
         );
         encoder.copy_buffer_to_buffer(
             &self.output_buffer,
             0,
-            &self.output_readback,
-            0,
+            &self.readback_buffer,
+            response_meta_copy_bytes,
             output_copy_bytes,
         );
         self.queue.submit([encoder.finish()]);
@@ -518,62 +516,26 @@ impl GpuProcessor {
         response_meta_copy_bytes: u64,
         output_copy_bytes: u64,
     ) -> Result<Vec<Vec<u8>>> {
-        let meta_slice = self
-            .response_meta_readback
-            .slice(0..response_meta_copy_bytes);
-        let output_slice = self.output_readback.slice(0..output_copy_bytes);
-        let (meta_sender, meta_receiver) = mpsc::sync_channel(1);
-        let (output_sender, output_receiver) = mpsc::sync_channel(1);
-
-        meta_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = meta_sender.send(result);
+        let readback_bytes = response_meta_copy_bytes
+            .checked_add(output_copy_bytes)
+            .context("HTTP readback copy size overflow")?;
+        let slice = self.readback_buffer.slice(0..readback_bytes);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
         });
-        output_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = output_sender.send(result);
-        });
-
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .context("waiting for GPU batch completion failed")?;
-
-        let meta_map_result = meta_receiver
+        receiver
             .recv()
-            .context("response metadata map callback disappeared")?;
-        let output_map_result = output_receiver
-            .recv()
-            .context("response output map callback disappeared")?;
+            .context("HTTP readback callback disappeared")??;
 
-        if let Err(error) = meta_map_result {
-            if output_map_result.is_ok() {
-                self.output_readback.unmap();
-            }
-            return Err(anyhow!("mapping response metadata failed: {error}"));
-        }
-
-        if let Err(error) = output_map_result {
-            self.response_meta_readback.unmap();
-            return Err(anyhow!("mapping response output failed: {error}"));
-        }
-
-        let meta_data = match meta_slice.get_mapped_range() {
-            Ok(data) => data,
-            Err(error) => {
-                self.output_readback.unmap();
-                self.response_meta_readback.unmap();
-                return Err(anyhow!("reading mapped response metadata failed: {error}"));
-            }
-        };
-        let output_data = match output_slice.get_mapped_range() {
-            Ok(data) => data,
-            Err(error) => {
-                drop(meta_data);
-                self.output_readback.unmap();
-                self.response_meta_readback.unmap();
-                return Err(anyhow!("reading mapped response output failed: {error}"));
-            }
-        };
-
+        let data = slice
+            .get_mapped_range()
+            .context("reading mapped HTTP responses failed")?;
         let decode_result = (|| -> Result<Vec<Vec<u8>>> {
+            let (meta_data, output_data) = data.split_at(response_meta_copy_bytes as usize);
             let response_stride_bytes = self.response_stride_words * size_of::<u32>();
             let mut responses = Vec::with_capacity(request_count);
 
@@ -606,11 +568,8 @@ impl GpuProcessor {
             Ok(responses)
         })();
 
-        drop(output_data);
-        drop(meta_data);
-        self.output_readback.unmap();
-        self.response_meta_readback.unmap();
-
+        drop(data);
+        self.readback_buffer.unmap();
         decode_result
     }
 }
@@ -680,6 +639,21 @@ fn pack_request_words(request: &[u8], destination: &mut [u32]) {
 mod tests {
     use super::*;
     use crate::builtin_router;
+
+    #[test]
+    fn router_response_slots_ignore_unused_configured_padding() {
+        let router = builtin_router()
+            .compile()
+            .expect("built-in router compiles");
+        let exact = words_for_bytes(router.max_gpu_response_bytes()).expect("exact stride");
+        let configured = words_for_bytes(512).expect("configured stride");
+
+        assert!(exact <= configured);
+        assert_eq!(
+            exact * size_of::<u32>(),
+            router.max_gpu_response_bytes().next_multiple_of(4)
+        );
+    }
 
     #[test]
     fn packs_bytes_little_endian_for_wgsl_extraction() {

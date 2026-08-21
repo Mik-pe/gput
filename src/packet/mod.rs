@@ -68,6 +68,11 @@ struct EngineParams {
 struct PacketScratch {
     metadata: Vec<PacketMeta>,
     words: Vec<u32>,
+    keys: Vec<Option<FlowKey>>,
+    pending: Vec<usize>,
+    deferred: Vec<usize>,
+    wave: Vec<usize>,
+    seen: HashSet<FlowKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,22 +346,20 @@ impl GpuPacketEngine {
         &self,
         packets: &[RawPacket],
         wave: &[usize],
-        scratch: &mut PacketScratch,
+        metadata: &mut Vec<PacketMeta>,
+        words: &mut Vec<u32>,
     ) -> Result<Vec<Option<RawPacket>>> {
         if wave.is_empty() {
             return Ok(Vec::new());
         }
         let packet_count = wave.len();
-        scratch.metadata.resize(packet_count, PacketMeta::zeroed());
-        scratch.words.resize(packet_count * INPUT_PACKET_WORDS, 0);
+        metadata.resize(packet_count, PacketMeta::zeroed());
+        words.resize(packet_count * INPUT_PACKET_WORDS, 0);
         for (packet_index, source_index) in wave.iter().copied().enumerate() {
             let packet = &packets[source_index];
-            scratch.metadata[packet_index].len = packet.bytes.len() as u32;
+            metadata[packet_index].len = packet.bytes.len() as u32;
             let base = packet_index * INPUT_PACKET_WORDS;
-            pack_packet(
-                &packet.bytes,
-                &mut scratch.words[base..base + INPUT_PACKET_WORDS],
-            );
+            pack_packet(&packet.bytes, &mut words[base..base + INPUT_PACKET_WORDS]);
         }
 
         let params = EngineParams {
@@ -369,9 +372,9 @@ impl GpuPacketEngine {
             _padding: [0; 2],
         };
         self.queue
-            .write_buffer(&self.input_meta, 0, bytemuck::cast_slice(&scratch.metadata));
+            .write_buffer(&self.input_meta, 0, bytemuck::cast_slice(metadata));
         self.queue
-            .write_buffer(&self.input_words, 0, bytemuck::cast_slice(&scratch.words));
+            .write_buffer(&self.input_words, 0, bytemuck::cast_slice(words));
         self.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
 
@@ -447,16 +450,57 @@ impl PacketEngine for GpuPacketEngine {
         if packets.is_empty() {
             return Ok(Vec::new());
         }
-        let waves = schedule_waves(packets, self.config.max_batch_size);
         let mut output = vec![None; packets.len()];
         let mut scratch = self
             .scratch
             .lock()
             .map_err(|_| anyhow::anyhow!("GPU packet scratch buffer poisoned"))?;
-        for wave in waves {
-            let wave_output = self.dispatch_wave(packets, &wave, &mut scratch)?;
-            for (index, packet) in wave.into_iter().zip(wave_output) {
+        scratch.keys.clear();
+        scratch.keys.extend(
+            packets
+                .iter()
+                .map(|packet| parse_ipv4_tcp(packet).map(|tcp| tcp.key)),
+        );
+        scratch.pending.clear();
+        scratch.pending.extend(0..packets.len());
+
+        while !scratch.pending.is_empty() {
+            {
+                let PacketScratch {
+                    keys,
+                    pending,
+                    deferred,
+                    wave,
+                    seen,
+                    ..
+                } = &mut *scratch;
+                fill_next_wave(
+                    keys,
+                    pending,
+                    self.config.max_batch_size,
+                    seen,
+                    wave,
+                    deferred,
+                );
+            }
+
+            let wave_output = {
+                let PacketScratch {
+                    metadata,
+                    words,
+                    wave,
+                    ..
+                } = &mut *scratch;
+                self.dispatch_wave(packets, wave, metadata, words)?
+            };
+            for (&index, packet) in scratch.wave.iter().zip(wave_output) {
                 output[index] = packet;
+            }
+            {
+                let PacketScratch {
+                    pending, deferred, ..
+                } = &mut *scratch;
+                std::mem::swap(pending, deferred);
             }
         }
         Ok(output)
@@ -547,35 +591,31 @@ fn max_response_packet_bytes() -> usize {
         .expect("packet response table is non-empty")
 }
 
-fn schedule_waves(packets: &[RawPacket], max_batch_size: usize) -> Vec<Vec<usize>> {
-    let keys = packets
-        .iter()
-        .map(|packet| parse_ipv4_tcp(packet).map(|tcp| tcp.key))
-        .collect::<Vec<_>>();
-    let mut pending = (0..packets.len()).collect::<Vec<_>>();
-    let mut waves = Vec::new();
+fn fill_next_wave(
+    keys: &[Option<FlowKey>],
+    pending: &[usize],
+    max_batch_size: usize,
+    seen: &mut HashSet<FlowKey>,
+    wave: &mut Vec<usize>,
+    deferred: &mut Vec<usize>,
+) {
+    seen.clear();
+    wave.clear();
+    deferred.clear();
 
-    while !pending.is_empty() {
-        let mut seen = HashSet::new();
-        let mut wave = Vec::with_capacity(max_batch_size.min(pending.len()));
-        let mut next = Vec::new();
-        for index in pending {
-            if wave.len() == max_batch_size {
-                next.push(index);
-                continue;
-            }
-            if let Some(key) = keys[index]
-                && !seen.insert(key)
-            {
-                next.push(index);
-                continue;
-            }
-            wave.push(index);
+    for &index in pending {
+        if wave.len() == max_batch_size {
+            deferred.push(index);
+            continue;
         }
-        waves.push(wave);
-        pending = next;
+        if let Some(key) = keys[index]
+            && !seen.insert(key)
+        {
+            deferred.push(index);
+            continue;
+        }
+        wave.push(index);
     }
-    waves
 }
 
 fn packet_shader_source() -> Result<String> {
@@ -789,9 +829,20 @@ mod tests {
                 .expect("packet builds")
             })
             .to_vec();
-        let waves = schedule_waves(&packets, 8);
+        let keys = packets
+            .iter()
+            .map(|packet| parse_ipv4_tcp(packet).map(|tcp| tcp.key))
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        let mut pending = vec![0, 1, 2];
+        let mut deferred = Vec::new();
+        let mut wave = Vec::new();
 
-        assert_eq!(waves, vec![vec![0, 2], vec![1]]);
+        fill_next_wave(&keys, &pending, 8, &mut seen, &mut wave, &mut deferred);
+        assert_eq!(wave, vec![0, 2]);
+        std::mem::swap(&mut pending, &mut deferred);
+        fill_next_wave(&keys, &pending, 8, &mut seen, &mut wave, &mut deferred);
+        assert_eq!(wave, vec![1]);
     }
 
     #[test]
