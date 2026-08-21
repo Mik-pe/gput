@@ -20,21 +20,25 @@ fn main() -> Result<()> {
     let syn = tcp_packet(CLIENT_ISN, 0, TCP_SYN, &[])?;
     let syn_ack = one_output(&engine, syn, "SYN")?;
     validate_ipv4_tcp_checksum(syn_ack.as_bytes())?;
-    ensure!(tcp_flags(syn_ack.as_bytes()) == TCP_SYN | TCP_ACK, "GPU did not emit SYN-ACK");
-    ensure!(tcp_ack(syn_ack.as_bytes()) == CLIENT_ISN + 1, "SYN-ACK acknowledged the wrong client sequence");
+    ensure!(
+        tcp_flags(syn_ack.as_bytes()) == TCP_SYN | TCP_ACK,
+        "GPU did not emit SYN-ACK"
+    );
+    ensure!(
+        tcp_ack(syn_ack.as_bytes()) == CLIENT_ISN + 1,
+        "SYN-ACK acknowledged the wrong client sequence"
+    );
     let server_isn = tcp_seq(syn_ack.as_bytes());
 
     let ack = tcp_packet(CLIENT_ISN + 1, server_isn + 1, TCP_ACK, &[])?;
     let handshake_output = engine.process_batch(&[ack])?;
-    ensure!(handshake_output == [None], "pure handshake ACK should not emit a packet");
+    ensure!(
+        handshake_output == [None],
+        "pure handshake ACK should not emit a packet"
+    );
 
     let request = b"GET /plaintext HTTP/1.1\r\nHost: gpu\r\nConnection: keep-alive\r\n\r\n";
-    let get = tcp_packet(
-        CLIENT_ISN + 1,
-        server_isn + 1,
-        TCP_ACK | TCP_PSH,
-        request,
-    )?;
+    let get = tcp_packet(CLIENT_ISN + 1, server_isn + 1, TCP_ACK | TCP_PSH, request)?;
     let response = one_output(&engine, get, "GET /plaintext")?;
     validate_ipv4_tcp_checksum(response.as_bytes())?;
     let payload = tcp_payload(response.as_bytes())?;
@@ -50,11 +54,17 @@ fn main() -> Result<()> {
         &[],
     )?;
     let fin_ack = one_output(&engine, fin, "FIN")?;
-    ensure!(tcp_flags(fin_ack.as_bytes()) == TCP_ACK, "GPU did not ACK FIN");
+    ensure!(
+        tcp_flags(fin_ack.as_bytes()) == TCP_ACK,
+        "GPU did not ACK FIN"
+    );
     validate_ipv4_tcp_checksum(fin_ack.as_bytes())?;
 
     println!("GPU packet TCP handshake: ok");
-    println!("GPU packet HTTP payload:\n{}", String::from_utf8_lossy(payload));
+    println!(
+        "GPU packet HTTP payload:\n{}",
+        String::from_utf8_lossy(payload)
+    );
     Ok(())
 }
 
@@ -94,7 +104,10 @@ fn tcp_packet(seq: u32, ack: u32, flags: u8, payload: &[u8]) -> Result<RawPacket
 fn validate_ipv4_tcp_checksum(packet: &[u8]) -> Result<()> {
     ensure!(packet.len() >= 40, "response packet is too small");
     ensure!(checksum(&packet[..20]) == 0, "invalid IPv4 header checksum");
-    ensure!(tcp_checksum_with_existing_field(packet) == 0, "invalid TCP checksum");
+    ensure!(
+        tcp_checksum_with_existing_field(packet) == 0,
+        "invalid TCP checksum"
+    );
     Ok(())
 }
 

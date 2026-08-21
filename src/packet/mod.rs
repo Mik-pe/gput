@@ -169,43 +169,17 @@ impl GpuPacketEngine {
             .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
             .context("flow buffer size overflow")?;
 
-        let input_meta = storage_buffer(
-            &device,
-            "packet input metadata",
-            packet_meta_bytes,
-            false,
-        );
-        let input_words = storage_buffer(
-            &device,
-            "packet input words",
-            packet_words_bytes,
-            false,
-        );
-        let output_meta = storage_buffer(
-            &device,
-            "packet output metadata",
-            packet_meta_bytes,
-            false,
-        );
-        let output_words = storage_buffer(
-            &device,
-            "packet output words",
-            packet_words_bytes,
-            false,
-        );
+        let input_meta = storage_buffer(&device, "packet input metadata", packet_meta_bytes, false);
+        let input_words = storage_buffer(&device, "packet input words", packet_words_bytes, false);
+        let output_meta =
+            storage_buffer(&device, "packet output metadata", packet_meta_bytes, false);
+        let output_words =
+            storage_buffer(&device, "packet output words", packet_words_bytes, false);
         let flow_state = storage_buffer(&device, "packet TCP flow state", flow_bytes, false);
-        let readback_meta = storage_buffer(
-            &device,
-            "packet readback metadata",
-            packet_meta_bytes,
-            true,
-        );
-        let readback_words = storage_buffer(
-            &device,
-            "packet readback words",
-            packet_words_bytes,
-            true,
-        );
+        let readback_meta =
+            storage_buffer(&device, "packet readback metadata", packet_meta_bytes, true);
+        let readback_words =
+            storage_buffer(&device, "packet readback words", packet_words_bytes, true);
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("packet engine params"),
             size: std::mem::size_of::<EngineParams>() as u64,
@@ -213,27 +187,26 @@ impl GpuPacketEngine {
             mapped_at_creation: false,
         });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("packet engine bind group layout"),
-                entries: &[
-                    storage_layout(0, true),
-                    storage_layout(1, true),
-                    storage_layout(2, false),
-                    storage_layout(3, false),
-                    storage_layout(4, false),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 5,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("packet engine bind group layout"),
+            entries: &[
+                storage_layout(0, true),
+                storage_layout(1, true),
+                storage_layout(2, false),
+                storage_layout(3, false),
+                storage_layout(4, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("packet engine bind group"),
             layout: &bind_group_layout,
@@ -246,12 +219,11 @@ impl GpuPacketEngine {
                 buffer_entry(5, &params),
             ],
         });
-        let pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("packet engine pipeline layout"),
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("packet engine pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("packet engine pipeline"),
             layout: Some(&pipeline_layout),
@@ -322,11 +294,11 @@ impl PacketEngine for GpuPacketEngine {
         self.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
 
-        let mut encoder =
-            self.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("packet engine dispatch"),
-                });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("packet engine dispatch"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("packet engine compute pass"),
@@ -448,7 +420,7 @@ fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_>
     }
 }
 
-fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<wgpu::BufferView<'_>> {
+fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<wgpu::BufferView> {
     let slice = buffer.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -458,7 +430,7 @@ fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<wgpu::Buffer
     receiver
         .recv()
         .context("GPU readback callback disappeared")??;
-    Ok(slice.get_mapped_range())
+    Ok(slice.get_mapped_range()?)
 }
 
 fn pack_bytes(bytes: &[u8]) -> Vec<u32> {
@@ -502,7 +474,9 @@ mod tests {
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
         );
-        validator.validate(&module).expect("packet shader validates");
+        validator
+            .validate(&module)
+            .expect("packet shader validates");
     }
 
     #[test]

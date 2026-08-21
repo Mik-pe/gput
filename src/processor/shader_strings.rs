@@ -185,7 +185,10 @@ mod tests {
         let assets = build_shader_assets("", &router).expect("assets build");
         let meta = assets.metadata[router.shader_string_ids().header_tail as usize];
 
-        assert_eq!(unpack_string(&assets, meta), PERSISTENT_GPU_HEADER_TAIL.as_bytes());
+        assert_eq!(
+            unpack_string(&assets, meta),
+            PERSISTENT_GPU_HEADER_TAIL.as_bytes()
+        );
     }
 
     #[test]
