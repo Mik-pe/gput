@@ -104,6 +104,30 @@ else
 fi
 cmp "$work_dir/expected-hello" "$work_dir/hello-body"
 
+curl --silent --show-error --fail \
+  --dump-header "$work_dir/utf8-headers" \
+  --output "$work_dir/utf8-body" \
+  "$base_url/utf8"
+printf 'räksmörgås kostar €5, hälsar UTF-8-ugglan 🦉🦀\n' \
+  >"$work_dir/expected-utf8"
+cmp "$work_dir/expected-utf8" "$work_dir/utf8-body"
+
+UTF8_HEADERS="$work_dir/utf8-headers" UTF8_BODY="$work_dir/utf8-body" python3 - <<'PY'
+import os
+from pathlib import Path
+
+headers = Path(os.environ["UTF8_HEADERS"]).read_bytes().replace(b"\r\n", b"\n")
+body = Path(os.environ["UTF8_BODY"]).read_bytes()
+content_length = next(
+    int(line.removeprefix(b"Content-Length: "))
+    for line in headers.splitlines()
+    if line.startswith(b"Content-Length: ")
+)
+
+assert content_length == len(body), (content_length, len(body))
+assert len(body.decode("utf-8")) < len(body), body
+PY
+
 curl --silent --show-error --fail "$base_url/" >"$work_dir/root-body"
 grep --fixed-strings "\"backend\":\"$backend\"" "$work_dir/root-body" >/dev/null
 
@@ -143,6 +167,7 @@ backend = os.environ["GPUT_SMOKE_BACKEND"].encode()
 cases = [
     (b"GET /health HTTP/1.0\r\n\r\n", b"HTTP/1.1 200 OK\r\n"),
     (b"GET /hello?source=raw HTTP/1.1\r\nHost: smoke\r\n\r\n", b"HTTP/1.1 200 OK\r\n"),
+    (b"GET /utf8?source=raw HTTP/1.1\r\nHost: smoke\r\n\r\n", b"HTTP/1.1 200 OK\r\n"),
     (b"GET / GPUT/6.6\r\n\r\n", b"HTTP/1.1 400 Bad Request\r\n"),
     (b"GET / HTTP/1.1\rX\nHost: smoke\r\n\r\n", b"HTTP/1.1 400 Bad Request\r\n"),
     (b"POST / HTTP/1.1\r\n\r\n", b"HTTP/1.1 405 Method Not Allowed\r\n"),

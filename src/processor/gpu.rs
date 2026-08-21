@@ -7,9 +7,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytemuck::{Pod, Zeroable};
 use tracing::info;
 
-use super::{Processor, ProcessorLimits};
+use super::{
+    Processor, ProcessorLimits,
+    shader_strings::{StringMeta, build_shader_assets},
+};
 
-const SHADER: &str = include_str!("http.wgsl");
+const SHADER_BODY: &str = include_str!("http.wgsl");
 const WORKGROUP_SIZE: u32 = 64;
 
 #[repr(C)]
@@ -50,6 +53,8 @@ pub struct GpuProcessor {
     input_buffer: wgpu::Buffer,
     response_meta_buffer: wgpu::Buffer,
     output_buffer: wgpu::Buffer,
+    _string_meta_buffer: wgpu::Buffer,
+    _string_words_buffer: wgpu::Buffer,
     response_meta_readback: wgpu::Buffer,
     output_readback: wgpu::Buffer,
     max_batch_size: usize,
@@ -60,6 +65,7 @@ pub struct GpuProcessor {
 
 impl GpuProcessor {
     pub fn new(limits: ProcessorLimits) -> Result<Self> {
+        let shader_assets = build_shader_assets(SHADER_BODY)?;
         let request_stride_words = words_for_bytes(limits.max_request_bytes)?;
         let response_stride_words = words_for_bytes(limits.response_slot_bytes)?;
         let request_meta_bytes = checked_buffer_bytes(
@@ -81,6 +87,16 @@ impl GpuProcessor {
             "response output",
             limits.max_batch_size,
             response_stride_words * size_of::<u32>(),
+        )?;
+        let string_meta_bytes = checked_buffer_bytes(
+            "shader string metadata",
+            shader_assets.metadata.len(),
+            size_of::<StringMeta>(),
+        )?;
+        let string_words_bytes = checked_buffer_bytes(
+            "shader string arena",
+            shader_assets.words.len(),
+            size_of::<u32>(),
         )?;
 
         let instance =
@@ -117,7 +133,7 @@ impl GpuProcessor {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gput-http-shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(shader_assets.source.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -150,6 +166,18 @@ impl GpuProcessor {
                 buffer_layout_entry(
                     4,
                     wgpu::BufferBindingType::Storage { read_only: false },
+                    false,
+                    size_of::<u32>(),
+                ),
+                buffer_layout_entry(
+                    5,
+                    wgpu::BufferBindingType::Storage { read_only: true },
+                    false,
+                    size_of::<StringMeta>(),
+                ),
+                buffer_layout_entry(
+                    6,
+                    wgpu::BufferBindingType::Storage { read_only: true },
                     false,
                     size_of::<u32>(),
                 ),
@@ -200,6 +228,18 @@ impl GpuProcessor {
             output_bytes,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         );
+        let string_meta_buffer = create_buffer(
+            &device,
+            "gput-string-meta",
+            string_meta_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let string_words_buffer = create_buffer(
+            &device,
+            "gput-string-arena",
+            string_words_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
         let response_meta_readback = create_buffer(
             &device,
             "gput-response-meta-readback",
@@ -211,6 +251,17 @@ impl GpuProcessor {
             "gput-output-readback",
             output_bytes,
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+
+        queue.write_buffer(
+            &string_meta_buffer,
+            0,
+            bytemuck::cast_slice(&shader_assets.metadata),
+        );
+        queue.write_buffer(
+            &string_words_buffer,
+            0,
+            bytemuck::cast_slice(&shader_assets.words),
         );
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -237,6 +288,14 @@ impl GpuProcessor {
                     binding: 4,
                     resource: output_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: string_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: string_words_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -247,6 +306,8 @@ impl GpuProcessor {
             max_batch_size = limits.max_batch_size,
             request_slot_bytes = request_stride_words * size_of::<u32>(),
             response_slot_bytes = response_stride_words * size_of::<u32>(),
+            shader_strings = shader_assets.metadata.len(),
+            shader_string_bytes = shader_assets.byte_len,
             "using GPU compute processor"
         );
 
@@ -261,6 +322,8 @@ impl GpuProcessor {
             input_buffer,
             response_meta_buffer,
             output_buffer,
+            _string_meta_buffer: string_meta_buffer,
+            _string_words_buffer: string_words_buffer,
             response_meta_readback,
             output_readback,
             max_batch_size: limits.max_batch_size,
@@ -554,8 +617,9 @@ mod tests {
     }
 
     #[test]
-    fn shader_parses_and_validates() {
-        let module = naga::front::wgsl::parse_str(SHADER).expect("WGSL must parse");
+    fn composed_shader_parses_and_validates() {
+        let assets = build_shader_assets(SHADER_BODY).expect("shader assets build");
+        let module = naga::front::wgsl::parse_str(&assets.source).expect("WGSL must parse");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),

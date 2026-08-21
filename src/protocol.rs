@@ -5,11 +5,25 @@ pub const MAX_GPU_RESPONSE_BYTES: usize = 256;
 const JSON_CONTENT_TYPE: &str = "application/json";
 const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
+pub(crate) const GPU_ROOT_BODY: &str =
+    "{\"name\":\"gput\",\"backend\":\"gpu\",\"message\":\"GET dispatched through a compute shader\"}\n";
+const CPU_ROOT_BODY: &str =
+    "{\"name\":\"gput\",\"backend\":\"cpu\",\"message\":\"GET handled by the CPU baseline\"}\n";
+pub(crate) const HEALTH_BODY: &str = "ok\n";
+pub(crate) const GPU_HELLO_BODY: &str = "hello from a compute shader\n";
+const CPU_HELLO_BODY: &str = "hello from the CPU baseline\n";
+pub(crate) const UTF8_BODY: &str =
+    "räksmörgås kostar €5, hälsar UTF-8-ugglan 🦉🦀\n";
+pub(crate) const NOT_FOUND_BODY: &str = "not found\n";
+pub(crate) const BAD_REQUEST_BODY: &str = "bad request\n";
+pub(crate) const METHOD_NOT_ALLOWED_BODY: &str = "method not allowed\n";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestRoute {
     Root,
     Health,
     Hello,
+    Utf8,
     NotFound,
     BadRequest,
     MethodNotAllowed,
@@ -18,39 +32,54 @@ enum RequestRoute {
 pub fn route_request(request: &[u8], backend: &'static str) -> Vec<u8> {
     match parse_request_route(request) {
         RequestRoute::Root => {
-            let body = format!(
-                "{{\"name\":\"gput\",\"backend\":\"{backend}\",\"message\":\"{}\"}}\n",
-                match backend {
-                    "gpu" => "GET dispatched through a compute shader",
-                    _ => "GET handled by the CPU baseline",
-                }
-            );
+            let body = if backend == "gpu" {
+                GPU_ROOT_BODY
+            } else {
+                CPU_ROOT_BODY
+            };
             build_response(200, "OK", JSON_CONTENT_TYPE, body.as_bytes(), backend)
         }
-        RequestRoute::Health => build_response(200, "OK", TEXT_CONTENT_TYPE, b"ok\n", backend),
+        RequestRoute::Health => build_response(
+            200,
+            "OK",
+            TEXT_CONTENT_TYPE,
+            HEALTH_BODY.as_bytes(),
+            backend,
+        ),
         RequestRoute::Hello => {
-            let body: &[u8] = if backend == "gpu" {
-                b"hello from a compute shader\n"
+            let body = if backend == "gpu" {
+                GPU_HELLO_BODY
             } else {
-                b"hello from the CPU baseline\n"
+                CPU_HELLO_BODY
             };
-            build_response(200, "OK", TEXT_CONTENT_TYPE, body, backend)
+            build_response(200, "OK", TEXT_CONTENT_TYPE, body.as_bytes(), backend)
         }
-        RequestRoute::NotFound => {
-            build_response(404, "Not Found", TEXT_CONTENT_TYPE, b"not found\n", backend)
-        }
+        RequestRoute::Utf8 => build_response(
+            200,
+            "OK",
+            TEXT_CONTENT_TYPE,
+            UTF8_BODY.as_bytes(),
+            backend,
+        ),
+        RequestRoute::NotFound => build_response(
+            404,
+            "Not Found",
+            TEXT_CONTENT_TYPE,
+            NOT_FOUND_BODY.as_bytes(),
+            backend,
+        ),
         RequestRoute::BadRequest => build_response(
             400,
             "Bad Request",
             TEXT_CONTENT_TYPE,
-            b"bad request\n",
+            BAD_REQUEST_BODY.as_bytes(),
             backend,
         ),
         RequestRoute::MethodNotAllowed => build_response(
             405,
             "Method Not Allowed",
             TEXT_CONTENT_TYPE,
-            b"method not allowed\n",
+            METHOD_NOT_ALLOWED_BODY.as_bytes(),
             backend,
         ),
     }
@@ -140,6 +169,7 @@ fn parse_request_route(request: &[u8]) -> RequestRoute {
         b"/" => RequestRoute::Root,
         b"/health" => RequestRoute::Health,
         b"/hello" => RequestRoute::Hello,
+        b"/utf8" => RequestRoute::Utf8,
         _ => RequestRoute::NotFound,
     }
 }
@@ -184,6 +214,15 @@ mod tests {
     }
 
     #[test]
+    fn routes_multibyte_utf8_body() {
+        let response = route_request(b"GET /utf8 HTTP/1.1\r\nHost: x\r\n\r\n", "cpu");
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(UTF8_BODY.as_bytes()));
+        assert!(UTF8_BODY.len() > UTF8_BODY.chars().count());
+    }
+
+    #[test]
     fn rejects_non_get_methods() {
         let response = route_request(b"POST / HTTP/1.1\r\n\r\n", "cpu");
 
@@ -199,7 +238,7 @@ mod tests {
 
     #[test]
     fn content_length_matches_body() {
-        let response = route_request(b"GET /hello HTTP/1.1\r\n\r\n", "cpu");
+        let response = route_request(b"GET /utf8 HTTP/1.1\r\n\r\n", "cpu");
         let separator = response
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -214,5 +253,18 @@ mod tests {
             .expect("numeric content length");
 
         assert_eq!(content_length, body.len());
+    }
+
+    #[test]
+    fn gpu_builtin_responses_fit_default_slot() {
+        for path in ["/", "/health", "/hello", "/utf8", "/missing"] {
+            let request = format!("GET {path} HTTP/1.1\r\n\r\n");
+            let response = route_request(request.as_bytes(), "gpu");
+            assert!(
+                response.len() <= MAX_GPU_RESPONSE_BYTES,
+                "{path} response is {} bytes",
+                response.len()
+            );
+        }
     }
 }

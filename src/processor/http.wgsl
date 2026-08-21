@@ -19,6 +19,27 @@ struct ResponseMeta {
     _padding: u32,
 };
 
+struct StringMeta {
+    byte_offset: u32,
+    byte_len: u32,
+    scalar_len: u32,
+    _padding: u32,
+};
+
+struct Writer {
+    request_index: u32,
+    cursor: u32,
+    flags: u32,
+    _padding: u32,
+};
+
+struct Utf8Scalar {
+    code_point: u32,
+    byte_width: u32,
+    valid: u32,
+    _padding: u32,
+};
+
 @group(0) @binding(0)
 var<uniform> params: Params;
 
@@ -34,338 +55,250 @@ var<storage, read_write> response_meta: array<ResponseMeta>;
 @group(0) @binding(4)
 var<storage, read_write> output_words: array<u32>;
 
+@group(0) @binding(5)
+var<storage, read> string_meta: array<StringMeta>;
+
+@group(0) @binding(6)
+var<storage, read> string_words: array<u32>;
+
 const FNV_OFFSET_BASIS: u32 = 2166136261u;
 const FNV_PRIME: u32 = 16777619u;
 
 const ROOT_PATH_HASH: u32 = 705468254u;
 const HEALTH_PATH_HASH: u32 = 1923151932u;
 const HELLO_PATH_HASH: u32 = 4088401502u;
+const UTF8_PATH_HASH: u32 = 1582453113u;
 
 const RESPONSE_ROOT_ID: u32 = 0u;
 const RESPONSE_HEALTH_ID: u32 = 1u;
 const RESPONSE_HELLO_ID: u32 = 2u;
-const RESPONSE_BAD_REQUEST_ID: u32 = 3u;
-const RESPONSE_METHOD_NOT_ALLOWED_ID: u32 = 4u;
-const RESPONSE_NOT_FOUND_ID: u32 = 5u;
+const RESPONSE_UTF8_ID: u32 = 3u;
+const RESPONSE_BAD_REQUEST_ID: u32 = 4u;
+const RESPONSE_METHOD_NOT_ALLOWED_ID: u32 = 5u;
+const RESPONSE_NOT_FOUND_ID: u32 = 6u;
 
-const RESPONSE_ROOT_BYTE_LEN: u32 = 209u;
-const RESPONSE_ROOT_WORD_LEN: u32 = 53u;
-const RESPONSE_ROOT: array<u32, 53> = array<u32, 53>(
-    0x50545448u,
-    0x312e312fu,
-    0x30303220u,
-    0x0d4b4f20u,
-    0x6e6f430au,
-    0x746e6574u,
-    0x7079542du,
-    0x61203a65u,
-    0x696c7070u,
-    0x69746163u,
-    0x6a2f6e6fu,
-    0x0d6e6f73u,
-    0x6e6f430au,
-    0x746e6574u,
-    0x6e654c2du,
-    0x3a687467u,
-    0x0d343820u,
-    0x6e6f430au,
-    0x7463656eu,
-    0x3a6e6f69u,
-    0x6f6c6320u,
-    0x0a0d6573u,
-    0x76726553u,
-    0x203a7265u,
-    0x74757067u,
-    0x2d580a0du,
-    0x74757047u,
-    0x6361422du,
-    0x646e656bu,
-    0x7067203au,
-    0x0d0a0d75u,
-    0x6e227b0au,
-    0x22656d61u,
-    0x7067223au,
-    0x2c227475u,
-    0x63616222u,
-    0x646e656bu,
-    0x67223a22u,
-    0x2c227570u,
-    0x73656d22u,
-    0x65676173u,
-    0x47223a22u,
-    0x64205445u,
-    0x61707369u,
-    0x65686374u,
-    0x68742064u,
-    0x67756f72u,
-    0x20612068u,
-    0x706d6f63u,
-    0x20657475u,
-    0x64616873u,
-    0x7d227265u,
-    0x0000000au,
-);
-
-fn copy_root(output_base: u32) {
-    for (var word_index = 0u; word_index < RESPONSE_ROOT_WORD_LEN; word_index = word_index + 1u) {
-        output_words[output_base + word_index] = RESPONSE_ROOT[word_index];
-    }
-}
-
-const RESPONSE_HEALTH_BYTE_LEN: u32 = 136u;
-const RESPONSE_HEALTH_WORD_LEN: u32 = 34u;
-const RESPONSE_HEALTH: array<u32, 34> = array<u32, 34>(
-    0x50545448u,
-    0x312e312fu,
-    0x30303220u,
-    0x0d4b4f20u,
-    0x6e6f430au,
-    0x746e6574u,
-    0x7079542du,
-    0x74203a65u,
-    0x2f747865u,
-    0x69616c70u,
-    0x63203b6eu,
-    0x73726168u,
-    0x753d7465u,
-    0x382d6674u,
-    0x6f430a0du,
-    0x6e65746eu,
-    0x654c2d74u,
-    0x6874676eu,
-    0x0d33203au,
-    0x6e6f430au,
-    0x7463656eu,
-    0x3a6e6f69u,
-    0x6f6c6320u,
-    0x0a0d6573u,
-    0x76726553u,
-    0x203a7265u,
-    0x74757067u,
-    0x2d580a0du,
-    0x74757047u,
-    0x6361422du,
-    0x646e656bu,
-    0x7067203au,
-    0x0d0a0d75u,
-    0x0a6b6f0au,
-);
-
-fn copy_health(output_base: u32) {
-    for (var word_index = 0u; word_index < RESPONSE_HEALTH_WORD_LEN; word_index = word_index + 1u) {
-        output_words[output_base + word_index] = RESPONSE_HEALTH[word_index];
-    }
-}
-
-const RESPONSE_HELLO_BYTE_LEN: u32 = 162u;
-const RESPONSE_HELLO_WORD_LEN: u32 = 41u;
-const RESPONSE_HELLO: array<u32, 41> = array<u32, 41>(
-    0x50545448u,
-    0x312e312fu,
-    0x30303220u,
-    0x0d4b4f20u,
-    0x6e6f430au,
-    0x746e6574u,
-    0x7079542du,
-    0x74203a65u,
-    0x2f747865u,
-    0x69616c70u,
-    0x63203b6eu,
-    0x73726168u,
-    0x753d7465u,
-    0x382d6674u,
-    0x6f430a0du,
-    0x6e65746eu,
-    0x654c2d74u,
-    0x6874676eu,
-    0x3832203au,
-    0x6f430a0du,
-    0x63656e6eu,
-    0x6e6f6974u,
-    0x6c63203au,
-    0x0d65736fu,
-    0x7265530au,
-    0x3a726576u,
-    0x75706720u,
-    0x580a0d74u,
-    0x7570472du,
-    0x61422d74u,
-    0x6e656b63u,
-    0x67203a64u,
-    0x0a0d7570u,
-    0x65680a0du,
-    0x206f6c6cu,
-    0x6d6f7266u,
-    0x63206120u,
-    0x75706d6fu,
-    0x73206574u,
-    0x65646168u,
-    0x00000a72u,
-);
-
-fn copy_hello(output_base: u32) {
-    for (var word_index = 0u; word_index < RESPONSE_HELLO_WORD_LEN; word_index = word_index + 1u) {
-        output_words[output_base + word_index] = RESPONSE_HELLO[word_index];
-    }
-}
-
-const RESPONSE_BAD_REQUEST_BYTE_LEN: u32 = 155u;
-const RESPONSE_BAD_REQUEST_WORD_LEN: u32 = 39u;
-const RESPONSE_BAD_REQUEST: array<u32, 39> = array<u32, 39>(
-    0x50545448u,
-    0x312e312fu,
-    0x30303420u,
-    0x64614220u,
-    0x71655220u,
-    0x74736575u,
-    0x6f430a0du,
-    0x6e65746eu,
-    0x79542d74u,
-    0x203a6570u,
-    0x74786574u,
-    0x616c702fu,
-    0x203b6e69u,
-    0x72616863u,
-    0x3d746573u,
-    0x2d667475u,
-    0x430a0d38u,
-    0x65746e6fu,
-    0x4c2d746eu,
-    0x74676e65u,
-    0x31203a68u,
-    0x430a0d32u,
-    0x656e6e6fu,
-    0x6f697463u,
-    0x63203a6eu,
-    0x65736f6cu,
-    0x65530a0du,
-    0x72657672u,
-    0x7067203au,
-    0x0a0d7475u,
-    0x70472d58u,
-    0x422d7475u,
-    0x656b6361u,
-    0x203a646eu,
-    0x0d757067u,
-    0x620a0d0au,
-    0x72206461u,
-    0x65757165u,
-    0x000a7473u,
-);
-
-fn copy_bad_request(output_base: u32) {
-    for (var word_index = 0u; word_index < RESPONSE_BAD_REQUEST_WORD_LEN; word_index = word_index + 1u) {
-        output_words[output_base + word_index] = RESPONSE_BAD_REQUEST[word_index];
-    }
-}
-
-const RESPONSE_METHOD_NOT_ALLOWED_BYTE_LEN: u32 = 169u;
-const RESPONSE_METHOD_NOT_ALLOWED_WORD_LEN: u32 = 43u;
-const RESPONSE_METHOD_NOT_ALLOWED: array<u32, 43> = array<u32, 43>(
-    0x50545448u,
-    0x312e312fu,
-    0x35303420u,
-    0x74654d20u,
-    0x20646f68u,
-    0x20746f4eu,
-    0x6f6c6c41u,
-    0x0d646577u,
-    0x6e6f430au,
-    0x746e6574u,
-    0x7079542du,
-    0x74203a65u,
-    0x2f747865u,
-    0x69616c70u,
-    0x63203b6eu,
-    0x73726168u,
-    0x753d7465u,
-    0x382d6674u,
-    0x6f430a0du,
-    0x6e65746eu,
-    0x654c2d74u,
-    0x6874676eu,
-    0x3931203au,
-    0x6f430a0du,
-    0x63656e6eu,
-    0x6e6f6974u,
-    0x6c63203au,
-    0x0d65736fu,
-    0x7265530au,
-    0x3a726576u,
-    0x75706720u,
-    0x580a0d74u,
-    0x7570472du,
-    0x61422d74u,
-    0x6e656b63u,
-    0x67203a64u,
-    0x0a0d7570u,
-    0x656d0a0du,
-    0x646f6874u,
-    0x746f6e20u,
-    0x6c6c6120u,
-    0x6465776fu,
-    0x0000000au,
-);
-
-fn copy_method_not_allowed(output_base: u32) {
-    for (var word_index = 0u; word_index < RESPONSE_METHOD_NOT_ALLOWED_WORD_LEN; word_index = word_index + 1u) {
-        output_words[output_base + word_index] = RESPONSE_METHOD_NOT_ALLOWED[word_index];
-    }
-}
-
-const RESPONSE_NOT_FOUND_BYTE_LEN: u32 = 151u;
-const RESPONSE_NOT_FOUND_WORD_LEN: u32 = 38u;
-const RESPONSE_NOT_FOUND: array<u32, 38> = array<u32, 38>(
-    0x50545448u,
-    0x312e312fu,
-    0x34303420u,
-    0x746f4e20u,
-    0x756f4620u,
-    0x0a0d646eu,
-    0x746e6f43u,
-    0x2d746e65u,
-    0x65707954u,
-    0x6574203au,
-    0x702f7478u,
-    0x6e69616cu,
-    0x6863203bu,
-    0x65737261u,
-    0x74753d74u,
-    0x0d382d66u,
-    0x6e6f430au,
-    0x746e6574u,
-    0x6e654c2du,
-    0x3a687467u,
-    0x0d303120u,
-    0x6e6f430au,
-    0x7463656eu,
-    0x3a6e6f69u,
-    0x6f6c6320u,
-    0x0a0d6573u,
-    0x76726553u,
-    0x203a7265u,
-    0x74757067u,
-    0x2d580a0du,
-    0x74757047u,
-    0x6361422du,
-    0x646e656bu,
-    0x7067203au,
-    0x0d0a0d75u,
-    0x746f6e0au,
-    0x756f6620u,
-    0x000a646eu,
-);
-
-fn copy_not_found(output_base: u32) {
-    for (var word_index = 0u; word_index < RESPONSE_NOT_FOUND_WORD_LEN; word_index = word_index + 1u) {
-        output_words[output_base + word_index] = RESPONSE_NOT_FOUND[word_index];
-    }
-}
+const RESPONSE_FLAG_OUTPUT_OVERFLOW: u32 = 1u;
+const RESPONSE_FLAG_INVALID_UTF8: u32 = 2u;
 
 fn request_byte(request_index: u32, byte_index: u32) -> u32 {
     let word_index = request_index * params.request_stride_words + byte_index / 4u;
     let shift = (byte_index & 3u) * 8u;
     return (input_words[word_index] >> shift) & 255u;
+}
+
+fn string_byte(string_id: u32, byte_index: u32) -> u32 {
+    let absolute_index = string_meta[string_id].byte_offset + byte_index;
+    let word = string_words[absolute_index / 4u];
+    let shift = (absolute_index & 3u) * 8u;
+    return (word >> shift) & 255u;
+}
+
+fn writer_new(request_index: u32) -> Writer {
+    return Writer(request_index, 0u, 0u, 0u);
+}
+
+fn writer_fail(writer: ptr<function, Writer>, flag: u32) {
+    (*writer).flags = (*writer).flags | flag;
+}
+
+fn writer_push_byte(writer: ptr<function, Writer>, byte: u32) {
+    if ((*writer).flags != 0u) {
+        return;
+    }
+
+    let capacity = params.response_stride_words * 4u;
+    if ((*writer).cursor >= capacity) {
+        writer_fail(writer, RESPONSE_FLAG_OUTPUT_OVERFLOW);
+        return;
+    }
+
+    let absolute_index = (*writer).request_index * capacity + (*writer).cursor;
+    let word_index = absolute_index / 4u;
+    let shift = (absolute_index & 3u) * 8u;
+    let mask = 255u << shift;
+    output_words[word_index] =
+        (output_words[word_index] & ~mask) | ((byte & 255u) << shift);
+    (*writer).cursor = (*writer).cursor + 1u;
+}
+
+fn writer_push_string(writer: ptr<function, Writer>, string_id: u32) {
+    let byte_len = string_meta[string_id].byte_len;
+    for (var byte_index = 0u; byte_index < byte_len; byte_index = byte_index + 1u) {
+        writer_push_byte(writer, string_byte(string_id, byte_index));
+    }
+}
+
+fn writer_push_decimal(writer: ptr<function, Writer>, value: u32) {
+    var divisor = 1u;
+    while (value / divisor >= 10u) {
+        divisor = divisor * 10u;
+    }
+
+    loop {
+        writer_push_byte(writer, 48u + (value / divisor) % 10u);
+        if (divisor == 1u) {
+            break;
+        }
+        divisor = divisor / 10u;
+    }
+}
+
+fn writer_push_code_point(writer: ptr<function, Writer>, code_point: u32) {
+    if (code_point <= 0x7fu) {
+        writer_push_byte(writer, code_point);
+        return;
+    }
+
+    if (code_point <= 0x7ffu) {
+        writer_push_byte(writer, 0xc0u | (code_point >> 6u));
+        writer_push_byte(writer, 0x80u | (code_point & 0x3fu));
+        return;
+    }
+
+    if (code_point >= 0xd800u && code_point <= 0xdfffu) {
+        writer_fail(writer, RESPONSE_FLAG_INVALID_UTF8);
+        return;
+    }
+
+    if (code_point <= 0xffffu) {
+        writer_push_byte(writer, 0xe0u | (code_point >> 12u));
+        writer_push_byte(writer, 0x80u | ((code_point >> 6u) & 0x3fu));
+        writer_push_byte(writer, 0x80u | (code_point & 0x3fu));
+        return;
+    }
+
+    if (code_point <= 0x10ffffu) {
+        writer_push_byte(writer, 0xf0u | (code_point >> 18u));
+        writer_push_byte(writer, 0x80u | ((code_point >> 12u) & 0x3fu));
+        writer_push_byte(writer, 0x80u | ((code_point >> 6u) & 0x3fu));
+        writer_push_byte(writer, 0x80u | (code_point & 0x3fu));
+        return;
+    }
+
+    writer_fail(writer, RESPONSE_FLAG_INVALID_UTF8);
+}
+
+fn invalid_utf8_scalar() -> Utf8Scalar {
+    return Utf8Scalar(0xfffdu, 1u, 0u, 0u);
+}
+
+fn is_utf8_continuation(byte: u32) -> bool {
+    return (byte & 0xc0u) == 0x80u;
+}
+
+fn decode_utf8_string(string_id: u32, byte_index: u32) -> Utf8Scalar {
+    let byte_len = string_meta[string_id].byte_len;
+    if (byte_index >= byte_len) {
+        return invalid_utf8_scalar();
+    }
+
+    let byte_0 = string_byte(string_id, byte_index);
+    if (byte_0 <= 0x7fu) {
+        return Utf8Scalar(byte_0, 1u, 1u, 0u);
+    }
+
+    if (byte_0 >= 0xc2u && byte_0 <= 0xdfu) {
+        if (byte_index + 1u >= byte_len) {
+            return invalid_utf8_scalar();
+        }
+        let byte_1 = string_byte(string_id, byte_index + 1u);
+        if (!is_utf8_continuation(byte_1)) {
+            return invalid_utf8_scalar();
+        }
+        let code_point = ((byte_0 & 0x1fu) << 6u) | (byte_1 & 0x3fu);
+        return Utf8Scalar(code_point, 2u, 1u, 0u);
+    }
+
+    if (byte_0 >= 0xe0u && byte_0 <= 0xefu) {
+        if (byte_index + 2u >= byte_len) {
+            return invalid_utf8_scalar();
+        }
+        let byte_1 = string_byte(string_id, byte_index + 1u);
+        let byte_2 = string_byte(string_id, byte_index + 2u);
+        if (!is_utf8_continuation(byte_2)) {
+            return invalid_utf8_scalar();
+        }
+
+        let second_is_valid =
+            (byte_0 == 0xe0u && byte_1 >= 0xa0u && byte_1 <= 0xbfu)
+            || (byte_0 == 0xedu && byte_1 >= 0x80u && byte_1 <= 0x9fu)
+            || (
+                byte_0 != 0xe0u
+                && byte_0 != 0xedu
+                && is_utf8_continuation(byte_1)
+            );
+        if (!second_is_valid) {
+            return invalid_utf8_scalar();
+        }
+
+        let code_point = ((byte_0 & 0x0fu) << 12u)
+            | ((byte_1 & 0x3fu) << 6u)
+            | (byte_2 & 0x3fu);
+        return Utf8Scalar(code_point, 3u, 1u, 0u);
+    }
+
+    if (byte_0 >= 0xf0u && byte_0 <= 0xf4u) {
+        if (byte_index + 3u >= byte_len) {
+            return invalid_utf8_scalar();
+        }
+        let byte_1 = string_byte(string_id, byte_index + 1u);
+        let byte_2 = string_byte(string_id, byte_index + 2u);
+        let byte_3 = string_byte(string_id, byte_index + 3u);
+        if (!is_utf8_continuation(byte_2) || !is_utf8_continuation(byte_3)) {
+            return invalid_utf8_scalar();
+        }
+
+        let second_is_valid =
+            (byte_0 == 0xf0u && byte_1 >= 0x90u && byte_1 <= 0xbfu)
+            || (byte_0 == 0xf4u && byte_1 >= 0x80u && byte_1 <= 0x8fu)
+            || (byte_0 >= 0xf1u && byte_0 <= 0xf3u && is_utf8_continuation(byte_1));
+        if (!second_is_valid) {
+            return invalid_utf8_scalar();
+        }
+
+        let code_point = ((byte_0 & 0x07u) << 18u)
+            | ((byte_1 & 0x3fu) << 12u)
+            | ((byte_2 & 0x3fu) << 6u)
+            | (byte_3 & 0x3fu);
+        return Utf8Scalar(code_point, 4u, 1u, 0u);
+    }
+
+    return invalid_utf8_scalar();
+}
+
+fn writer_push_utf8_string(writer: ptr<function, Writer>, string_id: u32) {
+    let meta = string_meta[string_id];
+    var byte_index = 0u;
+    var scalar_count = 0u;
+
+    loop {
+        if (byte_index >= meta.byte_len) {
+            break;
+        }
+
+        let scalar = decode_utf8_string(string_id, byte_index);
+        if (scalar.valid == 0u) {
+            writer_fail(writer, RESPONSE_FLAG_INVALID_UTF8);
+            return;
+        }
+
+        writer_push_code_point(writer, scalar.code_point);
+        byte_index = byte_index + scalar.byte_width;
+        scalar_count = scalar_count + 1u;
+    }
+
+    if (scalar_count != meta.scalar_len) {
+        writer_fail(writer, RESPONSE_FLAG_INVALID_UTF8);
+    }
+}
+
+fn writer_finish(writer: Writer, status: u32) {
+    if (writer.flags != 0u) {
+        response_meta[writer.request_index] = ResponseMeta(0u, 500u, writer.flags, 0u);
+        return;
+    }
+
+    response_meta[writer.request_index] = ResponseMeta(writer.cursor, status, 0u, 0u);
 }
 
 fn is_get_request(request_index: u32, input_len: u32) -> bool {
@@ -410,35 +343,23 @@ fn has_supported_http_version(request_index: u32, version_start: u32, input_len:
         && request_byte(request_index, version_start + 9u) == 10u;
 }
 
-fn response_byte_len(response_id: u32) -> u32 {
+fn response_status_string(response_id: u32) -> u32 {
     switch response_id {
-        case RESPONSE_ROOT_ID: { return RESPONSE_ROOT_BYTE_LEN; }
-        case RESPONSE_HEALTH_ID: { return RESPONSE_HEALTH_BYTE_LEN; }
-        case RESPONSE_HELLO_ID: { return RESPONSE_HELLO_BYTE_LEN; }
-        case RESPONSE_BAD_REQUEST_ID: { return RESPONSE_BAD_REQUEST_BYTE_LEN; }
-        case RESPONSE_METHOD_NOT_ALLOWED_ID: { return RESPONSE_METHOD_NOT_ALLOWED_BYTE_LEN; }
-        case RESPONSE_NOT_FOUND_ID: { return RESPONSE_NOT_FOUND_BYTE_LEN; }
-        default: { return RESPONSE_NOT_FOUND_BYTE_LEN; }
-    }
-}
-
-fn response_word_len(response_id: u32) -> u32 {
-    switch response_id {
-        case RESPONSE_ROOT_ID: { return RESPONSE_ROOT_WORD_LEN; }
-        case RESPONSE_HEALTH_ID: { return RESPONSE_HEALTH_WORD_LEN; }
-        case RESPONSE_HELLO_ID: { return RESPONSE_HELLO_WORD_LEN; }
-        case RESPONSE_BAD_REQUEST_ID: { return RESPONSE_BAD_REQUEST_WORD_LEN; }
-        case RESPONSE_METHOD_NOT_ALLOWED_ID: { return RESPONSE_METHOD_NOT_ALLOWED_WORD_LEN; }
-        case RESPONSE_NOT_FOUND_ID: { return RESPONSE_NOT_FOUND_WORD_LEN; }
-        default: { return RESPONSE_NOT_FOUND_WORD_LEN; }
+        case RESPONSE_ROOT_ID, RESPONSE_HEALTH_ID, RESPONSE_HELLO_ID, RESPONSE_UTF8_ID: {
+            return STRING_STATUS_OK;
+        }
+        case RESPONSE_BAD_REQUEST_ID: { return STRING_STATUS_BAD_REQUEST; }
+        case RESPONSE_METHOD_NOT_ALLOWED_ID: { return STRING_STATUS_METHOD_NOT_ALLOWED; }
+        case RESPONSE_NOT_FOUND_ID: { return STRING_STATUS_NOT_FOUND; }
+        default: { return STRING_STATUS_NOT_FOUND; }
     }
 }
 
 fn response_status(response_id: u32) -> u32 {
     switch response_id {
-        case RESPONSE_ROOT_ID: { return 200u; }
-        case RESPONSE_HEALTH_ID: { return 200u; }
-        case RESPONSE_HELLO_ID: { return 200u; }
+        case RESPONSE_ROOT_ID, RESPONSE_HEALTH_ID, RESPONSE_HELLO_ID, RESPONSE_UTF8_ID: {
+            return 200u;
+        }
         case RESPONSE_BAD_REQUEST_ID: { return 400u; }
         case RESPONSE_METHOD_NOT_ALLOWED_ID: { return 405u; }
         case RESPONSE_NOT_FOUND_ID: { return 404u; }
@@ -446,31 +367,48 @@ fn response_status(response_id: u32) -> u32 {
     }
 }
 
-fn write_response(request_index: u32, response_id: u32) {
-    let output_base = request_index * params.response_stride_words;
-    let word_len = response_word_len(response_id);
-
-    if (word_len > params.response_stride_words) {
-        response_meta[request_index] = ResponseMeta(0u, 500u, 1u, 0u);
-        return;
+fn response_content_type(response_id: u32) -> u32 {
+    if (response_id == RESPONSE_ROOT_ID) {
+        return STRING_CONTENT_TYPE_JSON;
     }
+    return STRING_CONTENT_TYPE_TEXT;
+}
 
+fn response_body(response_id: u32) -> u32 {
     switch response_id {
-        case RESPONSE_ROOT_ID: { copy_root(output_base); }
-        case RESPONSE_HEALTH_ID: { copy_health(output_base); }
-        case RESPONSE_HELLO_ID: { copy_hello(output_base); }
-        case RESPONSE_BAD_REQUEST_ID: { copy_bad_request(output_base); }
-        case RESPONSE_METHOD_NOT_ALLOWED_ID: { copy_method_not_allowed(output_base); }
-        case RESPONSE_NOT_FOUND_ID: { copy_not_found(output_base); }
-        default: { copy_not_found(output_base); }
+        case RESPONSE_ROOT_ID: { return STRING_BODY_ROOT; }
+        case RESPONSE_HEALTH_ID: { return STRING_BODY_HEALTH; }
+        case RESPONSE_HELLO_ID: { return STRING_BODY_HELLO; }
+        case RESPONSE_UTF8_ID: { return STRING_BODY_UTF8; }
+        case RESPONSE_BAD_REQUEST_ID: { return STRING_BODY_BAD_REQUEST; }
+        case RESPONSE_METHOD_NOT_ALLOWED_ID: { return STRING_BODY_METHOD_NOT_ALLOWED; }
+        case RESPONSE_NOT_FOUND_ID: { return STRING_BODY_NOT_FOUND; }
+        default: { return STRING_BODY_NOT_FOUND; }
+    }
+}
+
+fn write_response(request_index: u32, response_id: u32) {
+    let status_string_id = response_status_string(response_id);
+    let content_type_id = response_content_type(response_id);
+    let body_id = response_body(response_id);
+    let body_len = string_meta[body_id].byte_len;
+    var writer = writer_new(request_index);
+
+    writer_push_string(&writer, STRING_HTTP_VERSION);
+    writer_push_string(&writer, status_string_id);
+    writer_push_string(&writer, STRING_HEADER_CONTENT_TYPE);
+    writer_push_string(&writer, content_type_id);
+    writer_push_string(&writer, STRING_HEADER_CONTENT_LENGTH);
+    writer_push_decimal(&writer, body_len);
+    writer_push_string(&writer, STRING_HEADER_TAIL);
+
+    if (response_id == RESPONSE_UTF8_ID) {
+        writer_push_utf8_string(&writer, body_id);
+    } else {
+        writer_push_string(&writer, body_id);
     }
 
-    response_meta[request_index] = ResponseMeta(
-        response_byte_len(response_id),
-        response_status(response_id),
-        0u,
-        0u,
-    );
+    writer_finish(writer, response_status(response_id));
 }
 
 @compute @workgroup_size(64)
@@ -543,6 +481,8 @@ fn process_requests(@builtin(global_invocation_id) global_id: vec3<u32>) {
         response_id = RESPONSE_HEALTH_ID;
     } else if (path_len == 6u && path_hash == HELLO_PATH_HASH) {
         response_id = RESPONSE_HELLO_ID;
+    } else if (path_len == 5u && path_hash == UTF8_PATH_HASH) {
+        response_id = RESPONSE_UTF8_ID;
     }
 
     write_response(request_index, response_id);

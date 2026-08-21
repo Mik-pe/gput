@@ -1,5 +1,6 @@
 mod cpu;
 mod gpu;
+mod shader_strings;
 
 use anyhow::Result;
 use tracing::{info, warn};
