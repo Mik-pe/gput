@@ -33,6 +33,7 @@ The Rust router API is allowed to feel like a normal web framework. Its implemen
 - The built-in benchmark should be usable against non-gput servers. Do not bake competitor-specific shortcuts into the client.
 - Prefer medians across repeated runs over cherry-picked peaks. Report latency alongside throughput.
 - Keep `/plaintext` boring. It exists to expose transport and dispatch overhead, not to manufacture a GPU-friendly victory.
+- Benchmark changes need socket-level coverage for persistence and pipelining, not just parser unit tests.
 
 ## Scope
 
