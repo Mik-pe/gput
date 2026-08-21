@@ -3,6 +3,8 @@ use clap::Parser;
 use gput::{
     builtin_router,
     config::{Cli, ServerConfig},
+    response::Response,
+    routing::get,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -17,5 +19,6 @@ async fn main() -> Result<()> {
         .init();
 
     let config = ServerConfig::try_from(Cli::parse())?;
-    gput::serve(config, builtin_router()).await
+    let app = builtin_router().route("/plaintext", get(Response::text("Hello, World!")));
+    gput::serve(config, app).await
 }

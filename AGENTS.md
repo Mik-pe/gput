@@ -27,12 +27,19 @@ The Rust router API is allowed to feel like a normal web framework. Its implemen
 - New body opcodes require the Rust compiler, CPU interpreter, WGSL interpreter, size calculation, tests, and documentation in the same change.
 - Route hashes are only an index hint. Exact byte comparison must remain in place so collisions cannot select the wrong route.
 
+## Benchmark contract
+
+- HTTP/1.1 connections are persistent by default and may contain pipelined requests. The CPU may frame those request boundaries, but request-line parsing and routing still belong to the processor path.
+- The built-in benchmark should be usable against non-gput servers. Do not bake competitor-specific shortcuts into the client.
+- Prefer medians across repeated runs over cherry-picked peaks. Report latency alongside throughput.
+- Keep `/plaintext` boring. It exists to expose transport and dispatch overhead, not to manufacture a GPU-friendly victory.
+
 ## Scope
 
 The current target is intentionally narrow:
 
 - HTTP/1.0 and HTTP/1.1 request lines
-- one request per TCP connection
+- persistent HTTP/1.1 connections with basic pipelining support
 - exact static routes
 - `GET` only
 - bounded response programs

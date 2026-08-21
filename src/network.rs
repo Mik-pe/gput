@@ -92,68 +92,89 @@ async fn handle_connection(
     batcher: &BatcherHandle,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
+    let mut pending = Vec::with_capacity(config.max_request_bytes.min(4_096));
 
-    let request = match time::timeout(
-        config.read_timeout,
-        read_raw_request(stream, config.max_request_bytes),
-    )
-    .await
-    {
-        Err(_) => {
-            warn!(peer = %peer_address, "request read timed out");
-            return write_and_close(stream, &protocol::request_timeout_response()).await;
-        }
-        Ok(Err(ReadRequestError::TooLarge)) => {
-            return write_and_close(stream, &protocol::payload_too_large_response()).await;
-        }
-        Ok(Err(ReadRequestError::Incomplete)) => {
-            return write_and_close(stream, &protocol::incomplete_request_response()).await;
-        }
-        Ok(Err(ReadRequestError::Io(error))) => return Err(error.into()),
-        Ok(Ok(request)) => request,
-    };
+    loop {
+        let request = match time::timeout(
+            config.read_timeout,
+            read_raw_request(stream, &mut pending, config.max_request_bytes),
+        )
+        .await
+        {
+            Err(_) if pending.is_empty() => {
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(peer = %peer_address, "request read timed out");
+                return write_and_close(stream, &protocol::request_timeout_response()).await;
+            }
+            Ok(Err(ReadRequestError::TooLarge)) => {
+                return write_and_close(stream, &protocol::payload_too_large_response()).await;
+            }
+            Ok(Err(ReadRequestError::Incomplete)) => {
+                return write_and_close(stream, &protocol::incomplete_request_response()).await;
+            }
+            Ok(Err(ReadRequestError::Io(error))) => return Err(error.into()),
+            Ok(Ok(None)) => {
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            Ok(Ok(Some(request))) => request,
+        };
 
-    let response = match batcher.submit(request).await {
-        Ok(response) => response,
-        Err(SubmitError::Overloaded) => protocol::service_unavailable_response(),
-        Err(SubmitError::Stopped | SubmitError::Processing(_)) => {
-            protocol::internal_server_error_response()
-        }
-    };
+        let close_after_response = connection_should_close(&request);
+        let response = match batcher.submit(request).await {
+            Ok(response) => response,
+            Err(SubmitError::Overloaded) => protocol::service_unavailable_response(),
+            Err(SubmitError::Stopped | SubmitError::Processing(_)) => {
+                protocol::internal_server_error_response()
+            }
+        };
 
-    write_and_close(stream, &response).await
+        stream.write_all(&response).await?;
+        if close_after_response {
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    }
 }
 
 async fn read_raw_request<R>(
     stream: &mut R,
+    pending: &mut Vec<u8>,
     max_request_bytes: usize,
-) -> std::result::Result<Vec<u8>, ReadRequestError>
+) -> std::result::Result<Option<Vec<u8>>, ReadRequestError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut request = Vec::with_capacity(max_request_bytes.min(1_024));
     let mut chunk = [0_u8; 1_024];
 
     loop {
-        let bytes_read = stream.read(&mut chunk).await?;
-        if bytes_read == 0 {
-            return Err(ReadRequestError::Incomplete);
-        }
-
-        request.extend_from_slice(&chunk[..bytes_read]);
-
-        if let Some(header_len) = complete_header_len(&request) {
+        if let Some(header_len) = complete_header_len(pending) {
             if header_len > max_request_bytes {
                 return Err(ReadRequestError::TooLarge);
             }
 
-            request.truncate(header_len);
-            return Ok(request);
+            let remainder = pending.split_off(header_len);
+            let request = std::mem::replace(pending, remainder);
+            return Ok(Some(request));
         }
 
-        if request.len() >= max_request_bytes {
+        if pending.len() >= max_request_bytes {
             return Err(ReadRequestError::TooLarge);
         }
+
+        let bytes_read = stream.read(&mut chunk).await?;
+        if bytes_read == 0 {
+            return if pending.is_empty() {
+                Ok(None)
+            } else {
+                Err(ReadRequestError::Incomplete)
+            };
+        }
+
+        pending.extend_from_slice(&chunk[..bytes_read]);
     }
 }
 
@@ -162,6 +183,52 @@ fn complete_header_len(request: &[u8]) -> Option<usize> {
         .windows(HEADER_TERMINATOR.len())
         .position(|window| window == HEADER_TERMINATOR)
         .map(|position| position + HEADER_TERMINATOR.len())
+}
+
+fn connection_should_close(request: &[u8]) -> bool {
+    let Some(request_line_end) = request.windows(2).position(|window| window == b"\r\n") else {
+        return true;
+    };
+    let request_line = &request[..request_line_end];
+
+    if !request_line.ends_with(b" HTTP/1.1") {
+        return true;
+    }
+
+    connection_header_has_token(request, b"close")
+}
+
+fn connection_header_has_token(request: &[u8], token: &[u8]) -> bool {
+    for raw_line in request.split(|byte| *byte == b'\n').skip(1) {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            break;
+        }
+
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        if !trim_ascii(&line[..colon]).eq_ignore_ascii_case(b"connection") {
+            continue;
+        }
+
+        return line[colon + 1..]
+            .split(|byte| *byte == b',')
+            .map(trim_ascii)
+            .any(|value| value.eq_ignore_ascii_case(token));
+    }
+
+    false
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
 }
 
 async fn write_and_close(stream: &mut TcpStream, response: &[u8]) -> Result<()> {
@@ -185,32 +252,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discards_body_and_pipelined_bytes_after_headers() {
-        let headers = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
-        let mut wire = headers.to_vec();
-        wire.extend_from_slice(b"ignored bodyGET /hello HTTP/1.1\r\n\r\n");
+    async fn preserves_pipelined_bytes_for_the_next_request() {
+        let first = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
+        let second = b"GET /hello HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut wire = first.to_vec();
+        wire.extend_from_slice(second);
         let (mut writer, mut reader) = duplex(wire.len());
+        let mut pending = Vec::new();
 
-        writer.write_all(&wire).await.expect("write test request");
+        writer.write_all(&wire).await.expect("write pipelined requests");
         drop(writer);
 
-        let request = read_raw_request(&mut reader, headers.len())
+        let first_read = read_raw_request(&mut reader, &mut pending, 4_096)
             .await
-            .expect("header frame fits exactly");
-        assert_eq!(request, headers);
+            .expect("first request is framed")
+            .expect("first request exists");
+        let second_read = read_raw_request(&mut reader, &mut pending, 4_096)
+            .await
+            .expect("second request is framed")
+            .expect("second request exists");
+        let eof = read_raw_request(&mut reader, &mut pending, 4_096)
+            .await
+            .expect("clean EOF is not an incomplete request");
+
+        assert_eq!(first_read, first);
+        assert_eq!(second_read, second);
+        assert!(eof.is_none());
     }
 
     #[tokio::test]
     async fn rejects_an_incomplete_header_at_the_size_limit() {
         let request = b"GET / HTTP/1.1\r\nHost: unfinished";
         let (mut writer, mut reader) = duplex(request.len());
+        let mut pending = Vec::new();
 
         writer.write_all(request).await.expect("write test request");
         drop(writer);
 
         assert!(matches!(
-            read_raw_request(&mut reader, request.len()).await,
+            read_raw_request(&mut reader, &mut pending, request.len()).await,
             Err(ReadRequestError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn http11_is_persistent_unless_the_client_closes_it() {
+        assert!(!connection_should_close(
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        ));
+        assert!(connection_should_close(
+            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(connection_should_close(b"GET / HTTP/1.0\r\n\r\n"));
     }
 }

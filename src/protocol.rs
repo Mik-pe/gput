@@ -76,7 +76,6 @@ pub(crate) fn build_response(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
          Server: gput\r\n\
          X-Gput-Backend: {backend}\r\n\
          \r\n",
@@ -118,5 +117,6 @@ mod tests {
 
         assert_eq!(content_length, body.len());
         assert_eq!(body, UTF8_BODY.as_bytes());
+        assert!(!headers.contains("Connection: close"));
     }
 }
