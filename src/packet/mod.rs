@@ -24,7 +24,7 @@ use bytemuck::{Pod, Zeroable};
 
 pub const MAX_RAW_PACKET_BYTES: usize = 1536;
 
-const PACKET_WORDS: usize = MAX_RAW_PACKET_BYTES.div_ceil(4);
+const INPUT_PACKET_WORDS: usize = MAX_RAW_PACKET_BYTES.div_ceil(4);
 const FLOW_WORDS: usize = 16;
 const DEFAULT_FLOW_CAPACITY: usize = 4096;
 const DEFAULT_FLOW_PROBE_LIMIT: usize = 32;
@@ -56,11 +56,12 @@ struct PacketMeta {
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct EngineParams {
     packet_count: u32,
-    packet_stride_words: u32,
+    input_stride_words: u32,
+    output_stride_words: u32,
     flow_capacity: u32,
     listen_port: u32,
     flow_probe_limit: u32,
-    _padding: [u32; 3],
+    _padding: [u32; 2],
 }
 
 #[derive(Default)]
@@ -149,10 +150,10 @@ pub struct GpuPacketEngine {
     output_meta: wgpu::Buffer,
     output_words: wgpu::Buffer,
     _flow_state: wgpu::Buffer,
-    readback_meta: wgpu::Buffer,
-    readback_words: wgpu::Buffer,
+    readback: wgpu::Buffer,
     params: wgpu::Buffer,
     config: PacketEngineConfig,
+    output_stride_words: usize,
     adapter_name: String,
     dispatches: AtomicU64,
     packets: AtomicU64,
@@ -216,11 +217,20 @@ impl GpuPacketEngine {
             .max_batch_size
             .checked_mul(std::mem::size_of::<PacketMeta>())
             .context("packet metadata buffer size overflow")?;
-        let packet_words_bytes = config
+        let input_words_bytes = config
             .max_batch_size
-            .checked_mul(PACKET_WORDS)
+            .checked_mul(INPUT_PACKET_WORDS)
             .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
-            .context("packet word buffer size overflow")?;
+            .context("packet input buffer size overflow")?;
+        let output_stride_words = max_response_packet_bytes().div_ceil(std::mem::size_of::<u32>());
+        let output_words_bytes = config
+            .max_batch_size
+            .checked_mul(output_stride_words)
+            .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+            .context("packet output buffer size overflow")?;
+        let readback_bytes = packet_meta_bytes
+            .checked_add(output_words_bytes)
+            .context("combined packet readback size overflow")?;
         let flow_words = config
             .flow_capacity
             .checked_mul(FLOW_WORDS)
@@ -230,16 +240,13 @@ impl GpuPacketEngine {
             .context("flow buffer size overflow")?;
 
         let input_meta = storage_buffer(&device, "packet input metadata", packet_meta_bytes, false);
-        let input_words = storage_buffer(&device, "packet input words", packet_words_bytes, false);
+        let input_words = storage_buffer(&device, "packet input words", input_words_bytes, false);
         let output_meta =
             storage_buffer(&device, "packet output metadata", packet_meta_bytes, false);
         let output_words =
-            storage_buffer(&device, "packet output words", packet_words_bytes, false);
+            storage_buffer(&device, "packet output words", output_words_bytes, false);
         let flow_state = storage_buffer(&device, "packet TCP flow state", flow_bytes, false);
-        let readback_meta =
-            storage_buffer(&device, "packet readback metadata", packet_meta_bytes, true);
-        let readback_words =
-            storage_buffer(&device, "packet readback words", packet_words_bytes, true);
+        let readback = storage_buffer(&device, "combined packet readback", readback_bytes, true);
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("packet engine params"),
             size: std::mem::size_of::<EngineParams>() as u64,
@@ -303,6 +310,8 @@ impl GpuPacketEngine {
             flow_capacity = config.flow_capacity,
             flow_probe_limit = config.flow_probe_limit,
             listen_port = config.listen_port,
+            input_slot_bytes = INPUT_PACKET_WORDS * std::mem::size_of::<u32>(),
+            output_slot_bytes = output_stride_words * std::mem::size_of::<u32>(),
             "using collision-safe GPU-native packet engine"
         );
 
@@ -317,10 +326,10 @@ impl GpuPacketEngine {
             output_meta,
             output_words,
             _flow_state: flow_state,
-            readback_meta,
-            readback_words,
+            readback,
             params,
             config,
+            output_stride_words,
             adapter_name: adapter_info.name,
             dispatches: AtomicU64::new(0),
             packets: AtomicU64::new(0),
@@ -339,21 +348,25 @@ impl GpuPacketEngine {
         }
         let packet_count = wave.len();
         scratch.metadata.resize(packet_count, PacketMeta::zeroed());
-        scratch.words.resize(packet_count * PACKET_WORDS, 0);
+        scratch.words.resize(packet_count * INPUT_PACKET_WORDS, 0);
         for (packet_index, source_index) in wave.iter().copied().enumerate() {
             let packet = &packets[source_index];
             scratch.metadata[packet_index].len = packet.bytes.len() as u32;
-            let base = packet_index * PACKET_WORDS;
-            pack_packet(&packet.bytes, &mut scratch.words[base..base + PACKET_WORDS]);
+            let base = packet_index * INPUT_PACKET_WORDS;
+            pack_packet(
+                &packet.bytes,
+                &mut scratch.words[base..base + INPUT_PACKET_WORDS],
+            );
         }
 
         let params = EngineParams {
             packet_count: packet_count as u32,
-            packet_stride_words: PACKET_WORDS as u32,
+            input_stride_words: INPUT_PACKET_WORDS as u32,
+            output_stride_words: self.output_stride_words as u32,
             flow_capacity: self.config.flow_capacity as u32,
             listen_port: self.config.listen_port.into(),
             flow_probe_limit: self.config.flow_probe_limit as u32,
-            _padding: [0; 3],
+            _padding: [0; 2],
         };
         self.queue
             .write_buffer(&self.input_meta, 0, bytemuck::cast_slice(&scratch.metadata));
@@ -363,7 +376,9 @@ impl GpuPacketEngine {
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
 
         let meta_copy_bytes = (packet_count * std::mem::size_of::<PacketMeta>()) as u64;
-        let word_copy_bytes = (packet_count * PACKET_WORDS * std::mem::size_of::<u32>()) as u64;
+        let word_copy_bytes =
+            (packet_count * self.output_stride_words * std::mem::size_of::<u32>()) as u64;
+        let readback_copy_bytes = meta_copy_bytes + word_copy_bytes;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -378,54 +393,44 @@ impl GpuPacketEngine {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(packet_count.div_ceil(WORKGROUP_SIZE) as u32, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(
-            &self.output_meta,
-            0,
-            &self.readback_meta,
-            0,
-            meta_copy_bytes,
-        );
+        encoder.copy_buffer_to_buffer(&self.output_meta, 0, &self.readback, 0, meta_copy_bytes);
         encoder.copy_buffer_to_buffer(
             &self.output_words,
             0,
-            &self.readback_words,
-            0,
+            &self.readback,
+            meta_copy_bytes,
             word_copy_bytes,
         );
         self.queue.submit(Some(encoder.finish()));
 
-        let (meta_bytes, word_bytes) = map_two_reads(
-            &self.device,
-            &self.readback_meta,
-            meta_copy_bytes,
-            &self.readback_words,
-            word_copy_bytes,
-        )?;
-        let output_meta: &[PacketMeta] = bytemuck::cast_slice(&meta_bytes);
-        let output_words: &[u32] = bytemuck::cast_slice(&word_bytes);
-        let mut output = Vec::with_capacity(packet_count);
+        let readback = map_read(&self.device, &self.readback, readback_copy_bytes)?;
+        let output = {
+            let (meta_bytes, word_bytes) = readback.split_at(meta_copy_bytes as usize);
+            let output_meta: &[PacketMeta] = bytemuck::cast_slice(meta_bytes);
+            let output_words: &[u32] = bytemuck::cast_slice(word_bytes);
+            let mut output = Vec::with_capacity(packet_count);
 
-        for (index, meta) in output_meta.iter().enumerate() {
-            let len = meta.len as usize;
-            if len == 0 {
-                output.push(None);
-                continue;
+            for (index, meta) in output_meta.iter().enumerate() {
+                let len = meta.len as usize;
+                if len == 0 {
+                    output.push(None);
+                    continue;
+                }
+                ensure!(
+                    len <= self.output_stride_words * std::mem::size_of::<u32>(),
+                    "GPU produced packet of {len} bytes outside the tight response slot"
+                );
+                let base = index * self.output_stride_words;
+                output.push(Some(RawPacket::new(unpack_packet(
+                    &output_words[base..base + self.output_stride_words],
+                    len,
+                ))?));
             }
-            ensure!(
-                len <= MAX_RAW_PACKET_BYTES,
-                "GPU produced oversized packet of {len} bytes"
-            );
-            let base = index * PACKET_WORDS;
-            output.push(Some(RawPacket::new(unpack_packet(
-                &output_words[base..base + PACKET_WORDS],
-                len,
-            ))?));
-        }
+            output
+        };
 
-        drop(word_bytes);
-        drop(meta_bytes);
-        self.readback_words.unmap();
-        self.readback_meta.unmap();
+        drop(readback);
+        self.readback.unmap();
         self.dispatches.fetch_add(1, Ordering::Relaxed);
         self.packets
             .fetch_add(packet_count as u64, Ordering::Relaxed);
@@ -488,13 +493,8 @@ pub(crate) fn validate_config(config: PacketEngineConfig) -> Result<()> {
         config.flow_capacity <= u32::MAX as usize,
         "flow capacity must fit u32"
     );
-    let largest_response = PACKET_RESPONSES
-        .iter()
-        .map(|response| response.len())
-        .max()
-        .expect("packet response table is non-empty");
     ensure!(
-        40 + largest_response <= MAX_RAW_PACKET_BYTES,
+        max_response_packet_bytes() <= MAX_RAW_PACKET_BYTES,
         "largest packet response does not fit the raw packet slot"
     );
     Ok(())
@@ -537,6 +537,14 @@ pub(crate) fn packet_response(response_id: u32) -> &'static [u8] {
         .get(response_id as usize)
         .copied()
         .unwrap_or(PACKET_RESPONSES[RESPONSE_BAD_REQUEST as usize])
+}
+
+fn max_response_packet_bytes() -> usize {
+    40 + PACKET_RESPONSES
+        .iter()
+        .map(|response| response.len())
+        .max()
+        .expect("packet response table is non-empty")
 }
 
 fn schedule_waves(packets: &[RawPacket], max_batch_size: usize) -> Vec<Vec<usize>> {
@@ -677,53 +685,17 @@ fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_>
     }
 }
 
-fn map_two_reads(
-    device: &wgpu::Device,
-    first_buffer: &wgpu::Buffer,
-    first_size: u64,
-    second_buffer: &wgpu::Buffer,
-    second_size: u64,
-) -> Result<(wgpu::BufferView, wgpu::BufferView)> {
-    let first_slice = first_buffer.slice(0..first_size);
-    let second_slice = second_buffer.slice(0..second_size);
-    let (first_sender, first_receiver) = std::sync::mpsc::sync_channel(1);
-    let (second_sender, second_receiver) = std::sync::mpsc::sync_channel(1);
-    first_slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = first_sender.send(result);
-    });
-    second_slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = second_sender.send(result);
+fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer, size: u64) -> Result<wgpu::BufferView> {
+    let slice = buffer.slice(0..size);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
     });
     device.poll(wgpu::PollType::wait_indefinitely())?;
-
-    let first_result = first_receiver
+    receiver
         .recv()
-        .context("first GPU readback callback disappeared")?;
-    let second_result = second_receiver
-        .recv()
-        .context("second GPU readback callback disappeared")?;
-    if let Err(error) = first_result {
-        if second_result.is_ok() {
-            second_buffer.unmap();
-        }
-        anyhow::bail!("mapping first GPU readback failed: {error}");
-    }
-    if let Err(error) = second_result {
-        first_buffer.unmap();
-        anyhow::bail!("mapping second GPU readback failed: {error}");
-    }
-
-    let first = first_slice.get_mapped_range()?;
-    let second = match second_slice.get_mapped_range() {
-        Ok(second) => second,
-        Err(error) => {
-            drop(first);
-            first_buffer.unmap();
-            second_buffer.unmap();
-            return Err(error.into());
-        }
-    };
-    Ok((first, second))
+        .context("GPU packet readback callback disappeared")??;
+    Ok(slice.get_mapped_range()?)
 }
 
 fn pack_bytes(bytes: &[u8]) -> Vec<u32> {
@@ -751,9 +723,16 @@ mod tests {
     #[test]
     fn packet_word_packing_round_trips_unaligned_bytes() {
         let bytes = b"odd packet bytes";
-        let mut words = [0_u32; PACKET_WORDS];
+        let mut words = [0_u32; INPUT_PACKET_WORDS];
         pack_packet(bytes, &mut words);
         assert_eq!(unpack_packet(&words, bytes.len()), bytes);
+    }
+
+    #[test]
+    fn response_slots_are_tight_instead_of_mtu_sized_furniture_vans() {
+        let response_bytes = max_response_packet_bytes();
+        assert!(response_bytes < MAX_RAW_PACKET_BYTES / 2);
+        assert_eq!(response_bytes.div_ceil(std::mem::size_of::<u32>()), 56);
     }
 
     #[test]

@@ -7,13 +7,13 @@ struct PacketMeta {
 
 struct EngineParams {
     packet_count: u32,
-    packet_stride_words: u32,
+    input_stride_words: u32,
+    output_stride_words: u32,
     flow_capacity: u32,
     listen_port: u32,
     flow_probe_limit: u32,
     pad0: u32,
     pad1: u32,
-    pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> input_meta: array<PacketMeta>;
@@ -53,19 +53,19 @@ const FLOW_LAST_RESPONSE_LEN: u32 = 13u;
 const FLOW_GENERATION: u32 = 14u;
 
 fn read_byte(packet_index: u32, byte_index: u32) -> u32 {
-    let base = packet_index * params.packet_stride_words;
+    let base = packet_index * params.input_stride_words;
     let word = input_words[base + byte_index / 4u];
     return (word >> ((byte_index & 3u) * 8u)) & 0xffu;
 }
 
 fn read_output_byte(packet_index: u32, byte_index: u32) -> u32 {
-    let base = packet_index * params.packet_stride_words;
+    let base = packet_index * params.output_stride_words;
     let word = output_words[base + byte_index / 4u];
     return (word >> ((byte_index & 3u) * 8u)) & 0xffu;
 }
 
 fn write_byte(packet_index: u32, byte_index: u32, value: u32) {
-    let base = packet_index * params.packet_stride_words;
+    let base = packet_index * params.output_stride_words;
     let word_index = base + byte_index / 4u;
     let shift = (byte_index & 3u) * 8u;
     let mask = 0xffu << shift;
