@@ -48,6 +48,70 @@ jobs:
             sudo apt-get install --yes --no-install-recommends mesa-vulkan-drivers
           }
 
+          tun_gpu_smoke() {
+            local lvp_icd="$1"
+            local runtime_dir="$2"
+            local packet_log expected actual packet_pid success
+            packet_log="$(mktemp)"
+            expected="$(mktemp)"
+            actual="$(mktemp)"
+            packet_pid=""
+            success=false
+
+            cleanup_tun_smoke() {
+              if [[ -n "$packet_pid" ]]; then
+                sudo kill "$packet_pid" 2>/dev/null || true
+                wait "$packet_pid" 2>/dev/null || true
+              fi
+              rm -f "$packet_log" "$expected" "$actual"
+            }
+
+            sudo env \
+              WGPU_BACKEND=vulkan \
+              VK_DRIVER_FILES="$lvp_icd" \
+              VK_ICD_FILENAMES="$lvp_icd" \
+              XDG_RUNTIME_DIR="$runtime_dir" \
+              LIBGL_ALWAYS_SOFTWARE=true \
+              GALLIUM_DRIVER=llvmpipe \
+              target/debug/gput-packetd \
+                --local 10.77.0.1 \
+                --peer 10.77.0.2 \
+                --listen-port 18088 \
+                >"$packet_log" 2>&1 &
+            packet_pid=$!
+
+            printf 'Hello, World!\n' > "$expected"
+            for _ in $(seq 1 60); do
+              if curl --noproxy '*' --silent --show-error --fail --max-time 1 \
+                http://10.77.0.2:18088/plaintext > "$actual" 2>/dev/null; then
+                success=true
+                break
+              fi
+              if ! sudo kill -0 "$packet_pid" 2>/dev/null; then
+                break
+              fi
+              sleep 0.1
+            done
+
+            if [[ "$success" != true ]]; then
+              cat "$packet_log" >&2 || true
+              ip route >&2 || true
+              cleanup_tun_smoke
+              return 1
+            fi
+
+            cmp "$expected" "$actual" || {
+              cleanup_tun_smoke
+              return 1
+            }
+            ip route get 10.77.0.2 || {
+              cleanup_tun_smoke
+              return 1
+            }
+            cleanup_tun_smoke
+            return 0
+          }
+
           run_check "install Rust 1.97.1" \
             rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
           setup_status=$?
@@ -77,7 +141,7 @@ jobs:
                     -name 'lvp_icd*.json' -print -quit
                 )"
                 runtime_dir="$(mktemp -d)"
-                chmod 700 "$runtime_dir"
+                chmod 755 "$runtime_dir"
 
                 run_check "GPU socket smoke test through Lavapipe" \
                   env \
@@ -99,6 +163,9 @@ jobs:
                     LIBGL_ALWAYS_SOFTWARE=true \
                     GALLIUM_DRIVER=llvmpipe \
                   target/debug/gput-packet-demo
+
+                run_check "curl through TUN into GPU TCP" \
+                  tun_gpu_smoke "$lvp_icd" "$runtime_dir"
 
                 rm -rf "$runtime_dir"
               fi
@@ -123,9 +190,9 @@ jobs:
           state="$CHECK_RESULT"
           if [[ "$state" != "success" ]]; then
             state="failure"
-            description="Rust, protocol, benchmark, packet engine, or GPU smoke checks failed"
+            description="Rust, benchmark, sockets, TUN, or GPU packet checks failed"
           else
-            description="build, tests, benchmark, sockets, and GPU packet TCP passed"
+            description="build, sockets, TUN and GPU TCP fast path passed"
           fi
 
           gh api --method POST \
