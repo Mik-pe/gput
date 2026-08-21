@@ -131,10 +131,12 @@ fn worker_loop(
     config: BatcherConfig,
     metrics: Arc<BatcherMetrics>,
 ) {
+    let mut jobs = Vec::with_capacity(config.max_batch_size);
+
     while let Ok(first) = receiver.recv() {
         let collection_started = Instant::now();
         let deadline = collection_started + config.max_batch_wait;
-        let mut jobs = Vec::with_capacity(config.max_batch_size);
+        jobs.clear();
         jobs.push(first);
 
         while jobs.len() < config.max_batch_size {
@@ -182,7 +184,7 @@ fn worker_loop(
                     .completed_requests
                     .fetch_add(batch_size as u64, Ordering::Relaxed);
 
-                for (job, response) in jobs.into_iter().zip(responses) {
+                for (job, response) in jobs.drain(..).zip(responses) {
                     let _ = job.reply.send(Ok(response));
                 }
             }
@@ -192,7 +194,7 @@ fn worker_loop(
                     responses.len()
                 )
                 .into();
-                fail_batch(jobs, message, &metrics);
+                fail_batch(&mut jobs, message, &metrics);
             }
             Err(processing_error) => {
                 error!(
@@ -200,18 +202,18 @@ fn worker_loop(
                     error = %processing_error,
                     "processor batch failed"
                 );
-                fail_batch(jobs, processing_error.to_string().into(), &metrics);
+                fail_batch(&mut jobs, processing_error.to_string().into(), &metrics);
             }
         }
     }
 }
 
-fn fail_batch(jobs: Vec<Job>, message: Arc<str>, metrics: &BatcherMetrics) {
+fn fail_batch(jobs: &mut Vec<Job>, message: Arc<str>, metrics: &BatcherMetrics) {
     metrics
         .failed_requests
         .fetch_add(jobs.len() as u64, Ordering::Relaxed);
 
-    for job in jobs {
+    for job in jobs.drain(..) {
         let _ = job.reply.send(Err(Arc::clone(&message)));
     }
 }

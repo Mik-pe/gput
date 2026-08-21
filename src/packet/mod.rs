@@ -1,3 +1,6 @@
+#[cfg(target_endian = "big")]
+compile_error!("gput packet packing currently requires a little-endian host");
+
 mod cpu;
 mod wire;
 
@@ -10,7 +13,10 @@ pub use wire::{
 use std::{
     collections::HashSet,
     fmt::Write as _,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, ensure};
@@ -55,6 +61,12 @@ struct EngineParams {
     listen_port: u32,
     flow_probe_limit: u32,
     _padding: [u32; 3],
+}
+
+#[derive(Default)]
+struct PacketScratch {
+    metadata: Vec<PacketMeta>,
+    words: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +156,7 @@ pub struct GpuPacketEngine {
     adapter_name: String,
     dispatches: AtomicU64,
     packets: AtomicU64,
+    scratch: Mutex<PacketScratch>,
 }
 
 impl GpuPacketEngine {
@@ -311,20 +324,27 @@ impl GpuPacketEngine {
             adapter_name: adapter_info.name,
             dispatches: AtomicU64::new(0),
             packets: AtomicU64::new(0),
+            scratch: Mutex::new(PacketScratch::default()),
         })
     }
 
-    fn dispatch_wave(&self, packets: &[&RawPacket]) -> Result<Vec<Option<RawPacket>>> {
-        if packets.is_empty() {
+    fn dispatch_wave(
+        &self,
+        packets: &[RawPacket],
+        wave: &[usize],
+        scratch: &mut PacketScratch,
+    ) -> Result<Vec<Option<RawPacket>>> {
+        if wave.is_empty() {
             return Ok(Vec::new());
         }
-        let packet_count = packets.len();
-        let mut metadata = vec![PacketMeta::zeroed(); packet_count];
-        let mut words = vec![0_u32; packet_count * PACKET_WORDS];
-        for (packet_index, packet) in packets.iter().enumerate() {
-            metadata[packet_index].len = packet.bytes.len() as u32;
+        let packet_count = wave.len();
+        scratch.metadata.resize(packet_count, PacketMeta::zeroed());
+        scratch.words.resize(packet_count * PACKET_WORDS, 0);
+        for (packet_index, source_index) in wave.iter().copied().enumerate() {
+            let packet = &packets[source_index];
+            scratch.metadata[packet_index].len = packet.bytes.len() as u32;
             let base = packet_index * PACKET_WORDS;
-            pack_packet(&packet.bytes, &mut words[base..base + PACKET_WORDS]);
+            pack_packet(&packet.bytes, &mut scratch.words[base..base + PACKET_WORDS]);
         }
 
         let params = EngineParams {
@@ -336,9 +356,9 @@ impl GpuPacketEngine {
             _padding: [0; 3],
         };
         self.queue
-            .write_buffer(&self.input_meta, 0, bytemuck::cast_slice(&metadata));
+            .write_buffer(&self.input_meta, 0, bytemuck::cast_slice(&scratch.metadata));
         self.queue
-            .write_buffer(&self.input_words, 0, bytemuck::cast_slice(&words));
+            .write_buffer(&self.input_words, 0, bytemuck::cast_slice(&scratch.words));
         self.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
 
@@ -374,8 +394,13 @@ impl GpuPacketEngine {
         );
         self.queue.submit(Some(encoder.finish()));
 
-        let meta_bytes = map_read(&self.device, &self.readback_meta, meta_copy_bytes)?;
-        let word_bytes = map_read(&self.device, &self.readback_words, word_copy_bytes)?;
+        let (meta_bytes, word_bytes) = map_two_reads(
+            &self.device,
+            &self.readback_meta,
+            meta_copy_bytes,
+            &self.readback_words,
+            word_copy_bytes,
+        )?;
         let output_meta: &[PacketMeta] = bytemuck::cast_slice(&meta_bytes);
         let output_words: &[u32] = bytemuck::cast_slice(&word_bytes);
         let mut output = Vec::with_capacity(packet_count);
@@ -419,12 +444,12 @@ impl PacketEngine for GpuPacketEngine {
         }
         let waves = schedule_waves(packets, self.config.max_batch_size);
         let mut output = vec![None; packets.len()];
+        let mut scratch = self
+            .scratch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GPU packet scratch buffer poisoned"))?;
         for wave in waves {
-            let inputs = wave
-                .iter()
-                .map(|index| &packets[*index])
-                .collect::<Vec<_>>();
-            let wave_output = self.dispatch_wave(&inputs)?;
+            let wave_output = self.dispatch_wave(packets, &wave, &mut scratch)?;
             for (index, packet) in wave.into_iter().zip(wave_output) {
                 output[index] = packet;
             }
@@ -652,17 +677,53 @@ fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_>
     }
 }
 
-fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer, size: u64) -> Result<wgpu::BufferView> {
-    let slice = buffer.slice(0..size);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
+fn map_two_reads(
+    device: &wgpu::Device,
+    first_buffer: &wgpu::Buffer,
+    first_size: u64,
+    second_buffer: &wgpu::Buffer,
+    second_size: u64,
+) -> Result<(wgpu::BufferView, wgpu::BufferView)> {
+    let first_slice = first_buffer.slice(0..first_size);
+    let second_slice = second_buffer.slice(0..second_size);
+    let (first_sender, first_receiver) = std::sync::mpsc::sync_channel(1);
+    let (second_sender, second_receiver) = std::sync::mpsc::sync_channel(1);
+    first_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = first_sender.send(result);
+    });
+    second_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = second_sender.send(result);
     });
     device.poll(wgpu::PollType::wait_indefinitely())?;
-    receiver
+
+    let first_result = first_receiver
         .recv()
-        .context("GPU readback callback disappeared")??;
-    Ok(slice.get_mapped_range()?)
+        .context("first GPU readback callback disappeared")?;
+    let second_result = second_receiver
+        .recv()
+        .context("second GPU readback callback disappeared")?;
+    if let Err(error) = first_result {
+        if second_result.is_ok() {
+            second_buffer.unmap();
+        }
+        anyhow::bail!("mapping first GPU readback failed: {error}");
+    }
+    if let Err(error) = second_result {
+        first_buffer.unmap();
+        anyhow::bail!("mapping second GPU readback failed: {error}");
+    }
+
+    let first = first_slice.get_mapped_range()?;
+    let second = match second_slice.get_mapped_range() {
+        Ok(second) => second,
+        Err(error) => {
+            drop(first);
+            first_buffer.unmap();
+            second_buffer.unmap();
+            return Err(error.into());
+        }
+    };
+    Ok((first, second))
 }
 
 fn pack_bytes(bytes: &[u8]) -> Vec<u32> {
@@ -674,16 +735,13 @@ fn pack_bytes(bytes: &[u8]) -> Vec<u32> {
 }
 
 fn pack_packet(bytes: &[u8], words: &mut [u32]) {
-    words.fill(0);
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        words[index / 4] |= u32::from(byte) << ((index % 4) * 8);
-    }
+    let destination: &mut [u8] = bytemuck::cast_slice_mut(words);
+    destination[..bytes.len()].copy_from_slice(bytes);
 }
 
 fn unpack_packet(words: &[u32], len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|index| ((words[index / 4] >> ((index % 4) * 8)) & 0xff) as u8)
-        .collect()
+    let bytes: &[u8] = bytemuck::cast_slice(words);
+    bytes[..len].to_vec()
 }
 
 #[cfg(test)]

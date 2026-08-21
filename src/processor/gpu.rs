@@ -76,6 +76,8 @@ pub struct GpuProcessor {
     max_request_bytes: usize,
     request_stride_words: usize,
     response_stride_words: usize,
+    request_meta_scratch: Vec<RequestMeta>,
+    input_words_scratch: Vec<u32>,
 }
 
 impl GpuProcessor {
@@ -394,6 +396,8 @@ impl GpuProcessor {
             max_request_bytes: limits.max_request_bytes,
             request_stride_words,
             response_stride_words,
+            request_meta_scratch: Vec::with_capacity(limits.max_batch_size),
+            input_words_scratch: Vec::with_capacity(limits.max_batch_size * request_stride_words),
         })
     }
 
@@ -411,8 +415,9 @@ impl GpuProcessor {
         }
 
         let request_count = requests.len();
-        let mut input_words = vec![0_u32; request_count * self.request_stride_words];
-        let mut request_meta = Vec::with_capacity(request_count);
+        self.input_words_scratch
+            .resize(request_count * self.request_stride_words, 0);
+        self.request_meta_scratch.clear();
 
         for (request_index, request) in requests.iter().enumerate() {
             if request.len() > self.max_request_bytes {
@@ -425,10 +430,10 @@ impl GpuProcessor {
 
             pack_request_words(
                 request,
-                &mut input_words[request_index * self.request_stride_words
+                &mut self.input_words_scratch[request_index * self.request_stride_words
                     ..(request_index + 1) * self.request_stride_words],
             );
-            request_meta.push(RequestMeta {
+            self.request_meta_scratch.push(RequestMeta {
                 input_len: u32::try_from(request.len())
                     .context("request length does not fit u32")?,
                 _padding_0: 0,
@@ -458,10 +463,13 @@ impl GpuProcessor {
         self.queue.write_buffer(
             &self.request_meta_buffer,
             0,
-            bytemuck::cast_slice(&request_meta),
+            bytemuck::cast_slice(&self.request_meta_scratch),
         );
-        self.queue
-            .write_buffer(&self.input_buffer, 0, bytemuck::cast_slice(&input_words));
+        self.queue.write_buffer(
+            &self.input_buffer,
+            0,
+            bytemuck::cast_slice(&self.input_words_scratch),
+        );
 
         let response_meta_copy_bytes = u64::try_from(request_count * size_of::<ResponseMeta>())
             .context("response metadata copy size overflow")?;
@@ -664,13 +672,8 @@ fn checked_buffer_bytes(label: &str, count: usize, stride: usize) -> Result<u64>
 }
 
 fn pack_request_words(request: &[u8], destination: &mut [u32]) {
-    destination.fill(0);
-
-    for (byte_index, byte) in request.iter().copied().enumerate() {
-        let word_index = byte_index / 4;
-        let shift = (byte_index % 4) * 8;
-        destination[word_index] |= u32::from(byte) << shift;
-    }
+    let destination: &mut [u8] = bytemuck::cast_slice_mut(destination);
+    destination[..request.len()].copy_from_slice(request);
 }
 
 #[cfg(test)]

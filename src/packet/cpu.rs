@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Mutex,
+        Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -162,7 +162,7 @@ fn process_packet(
                 last.response_seq,
                 last.response_ack,
                 TCP_ACK | TCP_PSH,
-                &response,
+                response,
             )
             .map(Some);
         }
@@ -197,28 +197,33 @@ fn process_packet(
         response_ack: next_ack,
         response_id,
     });
-    let output = emit(
-        tcp.key,
-        response_seq,
-        next_ack,
-        TCP_ACK | TCP_PSH,
-        &response,
-    )?;
+    let output = emit(tcp.key, response_seq, next_ack, TCP_ACK | TCP_PSH, response)?;
     if has_fin {
         flows.remove(&tcp.key);
     }
     Ok(Some(output))
 }
 
-fn cpu_response(response_id: u32) -> Vec<u8> {
-    let mut response = packet_response(response_id).to_vec();
-    if let Some(offset) = response
-        .windows(b"gpu-packet".len())
-        .position(|window| window == b"gpu-packet")
-    {
-        response[offset..offset + b"cpu-packet".len()].copy_from_slice(b"cpu-packet");
-    }
-    response
+fn cpu_response(response_id: u32) -> &'static [u8] {
+    static RESPONSES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    let responses = RESPONSES.get_or_init(|| {
+        (0..super::PACKET_RESPONSES.len())
+            .map(|index| {
+                let mut response = packet_response(index as u32).to_vec();
+                if let Some(offset) = response
+                    .windows(b"gpu-packet".len())
+                    .position(|window| window == b"gpu-packet")
+                {
+                    response[offset..offset + b"cpu-packet".len()].copy_from_slice(b"cpu-packet");
+                }
+                response
+            })
+            .collect()
+    });
+    responses
+        .get(response_id as usize)
+        .unwrap_or(&responses[super::RESPONSE_BAD_REQUEST as usize])
+        .as_slice()
 }
 
 fn emit(key: FlowKey, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> Result<RawPacket> {

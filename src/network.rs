@@ -156,8 +156,7 @@ where
                 return Err(ReadRequestError::TooLarge);
             }
 
-            let remainder = pending.split_off(header_len);
-            let request = std::mem::replace(pending, remainder);
+            let request = pending.drain(..header_len).collect::<Vec<_>>();
             return Ok(Some(request));
         }
 
