@@ -88,9 +88,10 @@ jobs:
           source = path.read_text()
           old = "updated, count = re.subn(pattern, replacement, source, count=1, flags=re.DOTALL)"
           new = "updated, count = re.subn(pattern, lambda _match: replacement, source, count=1, flags=re.DOTALL)"
-          if old not in source:
-              raise SystemExit("expected regex replacement helper was not found")
-          path.write_text(source.replace(old, new, 1))
+          if old in source:
+              path.write_text(source.replace(old, new, 1))
+          elif "lambda _match: replacement" not in source:
+              raise SystemExit("regex replacement helper is neither legacy nor repaired")
           PY
 
       - name: Apply aligned response templates and checksum sums
