@@ -1,4 +1,4 @@
-name: trigger source-only speed surgery
+name: trigger borrow-safe speed surgery
 
 on:
   push:
