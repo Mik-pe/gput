@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - .gput-router-payload.tar.xz
+      - .github/workflows/apply-router-payload.yml
   workflow_dispatch:
 
 permissions:
