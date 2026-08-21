@@ -90,6 +90,16 @@ jobs:
                     GALLIUM_DRIVER=llvmpipe \
                   bash scripts/smoke.sh gpu target/debug/gput
 
+                run_check "GPU TCP packet demo through Lavapipe" \
+                  env \
+                    WGPU_BACKEND=vulkan \
+                    VK_DRIVER_FILES="$lvp_icd" \
+                    VK_ICD_FILENAMES="$lvp_icd" \
+                    XDG_RUNTIME_DIR="$runtime_dir" \
+                    LIBGL_ALWAYS_SOFTWARE=true \
+                    GALLIUM_DRIVER=llvmpipe \
+                  target/debug/gput-packet-demo
+
                 rm -rf "$runtime_dir"
               fi
             fi
@@ -113,9 +123,9 @@ jobs:
           state="$CHECK_RESULT"
           if [[ "$state" != "success" ]]; then
             state="failure"
-            description="Rust, protocol, benchmark, or GPU smoke checks failed"
+            description="Rust, protocol, benchmark, packet engine, or GPU smoke checks failed"
           else
-            description="locked build, tests, benchmark, and CPU/GPU smoke passed"
+            description="build, tests, benchmark, sockets, and GPU packet TCP passed"
           fi
 
           gh api --method POST \
