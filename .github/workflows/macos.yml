@@ -1,0 +1,28 @@
+name: macOS portability
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packet-bridge:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.97.1
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Check all Rust targets against macOS APIs
+        run: cargo +1.97.1 check --locked --all-targets --all-features
+
+      - name: Build the portable TUN to GPU bridge
+        run: cargo +1.97.1 build --locked --bin gput-packetd
+
+      - name: Validate packet shader semantics without requiring a hosted GPU
+        run: cargo +1.97.1 test --locked packet::tests::packet_shader_parses_and_validates
