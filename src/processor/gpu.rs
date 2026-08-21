@@ -14,6 +14,7 @@ use super::{
 
 const SHADER_BODY: &str = include_str!("http.wgsl");
 const WORKGROUP_SIZE: u32 = 64;
+const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 6;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -121,10 +122,14 @@ impl GpuProcessor {
             );
         }
 
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        required_limits.max_storage_buffers_per_shader_stage =
+            REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE;
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gput-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
