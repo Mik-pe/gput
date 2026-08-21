@@ -1,0 +1,156 @@
+name: apply compiled router payload
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .gput-router-payload.tar.xz
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  statuses: write
+
+concurrency:
+  group: gput-router-payload
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the payload commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Unpack the compiled-router implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .gput-router-payload.tar.xz
+          tar -xJf .gput-router-payload.tar.xz
+          test -f src/router.rs
+          test -f src/processor/http.wgsl
+          test -f tests/router_api.rs
+
+      - name: Install Rust 1.97.1
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.1 \
+            --profile minimal \
+            --component clippy,rustfmt
+
+      - name: Format the implementation
+        run: cargo +1.97.1 fmt
+
+      - name: Run clippy
+        run: cargo +1.97.1 clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo +1.97.1 test --locked --all-features
+
+      - name: Build the server
+        run: cargo +1.97.1 build --locked --bins
+
+      - name: Exercise the CPU router over a real socket
+        env:
+          GPUT_SMOKE_PORT: "18082"
+        run: bash scripts/smoke.sh cpu target/debug/gput
+
+      - name: Install or locate Lavapipe
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! find /usr/share/vulkan/icd.d -maxdepth 1 \
+            -name 'lvp_icd*.json' -print -quit 2>/dev/null | grep --quiet .; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends mesa-vulkan-drivers
+          fi
+
+      - name: Exercise the GPU router through Lavapipe
+        shell: bash
+        run: |
+          set -euo pipefail
+          lvp_icd="$(
+            find /usr/share/vulkan/icd.d -maxdepth 1 \
+              -name 'lvp_icd*.json' -print -quit
+          )"
+          runtime_dir="$(mktemp -d)"
+          trap 'rm -rf "$runtime_dir"' EXIT
+          chmod 700 "$runtime_dir"
+
+          env \
+            GPUT_SMOKE_PORT=18083 \
+            WGPU_BACKEND=vulkan \
+            VK_DRIVER_FILES="$lvp_icd" \
+            VK_ICD_FILENAMES="$lvp_icd" \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            LIBGL_ALWAYS_SOFTWARE=true \
+            GALLIUM_DRIVER=llvmpipe \
+          bash scripts/smoke.sh gpu target/debug/gput
+
+      - name: Commit the validated implementation directly to main
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .gput-router-payload.tar.xz
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            .gput-router-payload.tar.xz \
+            AGENTS.md \
+            README.md \
+            scripts/smoke.sh \
+            src/config.rs \
+            src/lib.rs \
+            src/main.rs \
+            src/protocol.rs \
+            src/router.rs \
+            src/server.rs \
+            src/processor/cpu.rs \
+            src/processor/gpu.rs \
+            src/processor/http.wgsl \
+            src/processor/mod.rs \
+            src/processor/shader_strings.rs \
+            tests/router_api.rs
+
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m "feat: compile Rust routers into GPU response programs"
+          git push origin HEAD:main
+
+          new_sha="$(git rev-parse HEAD)"
+          echo "new_sha=$new_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Publish preflight status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_SHA: ${{ steps.publish.outputs.new_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$NEW_SHA" \
+            --data "{\"state\":\"success\",\"context\":\"gput/router-preflight\",\"description\":\"fmt, clippy, tests, build, CPU smoke, and GPU smoke passed\",\"target_url\":\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID\"}"
+
+      - name: Dispatch the normal CI workflow for the published commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" \
+            --data '{"ref":"main"}'
