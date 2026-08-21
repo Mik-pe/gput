@@ -6,9 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
-use gput::packet::{
-    CpuPacketEngine, GpuPacketEngine, PacketEngine, PacketEngineConfig, RawPacket,
-};
+use gput::packet::{CpuPacketEngine, GpuPacketEngine, PacketEngine, PacketEngineConfig, RawPacket};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -226,7 +224,10 @@ fn select_engine(
     }
 }
 
-fn select_gpu(config: PacketEngineConfig, fallback_reason: Option<String>) -> Result<SelectedEngine> {
+fn select_gpu(
+    config: PacketEngineConfig,
+    fallback_reason: Option<String>,
+) -> Result<SelectedEngine> {
     let engine = GpuPacketEngine::new(config)?;
     Ok(SelectedEngine {
         adapter: Some(engine.adapter_name().to_owned()),
