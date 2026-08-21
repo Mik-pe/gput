@@ -61,6 +61,12 @@ jobs:
 
           cpu = Path("src/packet/cpu.rs")
           source = cpu.read_text()
+          source = source.replace("use anyhow::{Context, Result};", "use anyhow::Result;", 1)
+          source = source.replace(
+              'let mut flows = self.flows.lock().context("CPU packet flow table poisoned")?;',
+              'let mut flows = self.flows.lock().map_err(|_| anyhow::anyhow!("CPU packet flow table poisoned"))?;',
+              1,
+          )
           source = source.replace(
               "if tcp.flags & TCP_ACK != 0 && tcp.ack == flow.send_next {",
               "if tcp.flags & TCP_ACK != 0\n        && tcp.ack == flow.send_next\n        && tcp.ack != flow.send_unacked\n    {",
