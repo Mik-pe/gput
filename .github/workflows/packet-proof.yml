@@ -1,0 +1,121 @@
+name: packet proof
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/packet-proof.yml
+      - Cargo.lock
+      - Cargo.toml
+      - scripts/prove-gpu.sh
+      - src/bin/gput-packet-bench.rs
+      - src/bin/gput-packet-demo.rs
+      - src/bin/gput-packetd.rs
+      - src/packet/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  cpu-gpu-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Run permanent CPU and GPU packet proof
+        id: proof
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal
+          cargo +1.97.1 build --release --locked \
+            --bin gput-packet-demo \
+            --bin gput-packet-bench
+
+          if ! find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit \
+            2>/dev/null | grep --quiet .; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends mesa-vulkan-drivers
+          fi
+
+          lvp_icd="$(
+            find /usr/share/vulkan/icd.d -maxdepth 1 \
+              -name 'lvp_icd*.json' -print -quit
+          )"
+          runtime_dir="$(mktemp -d)"
+          trap 'rm -rf "$runtime_dir"' EXIT
+          chmod 700 "$runtime_dir"
+
+          env \
+            WGPU_BACKEND=vulkan \
+            VK_DRIVER_FILES="$lvp_icd" \
+            VK_ICD_FILENAMES="$lvp_icd" \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            LIBGL_ALWAYS_SOFTWARE=true \
+            GALLIUM_DRIVER=llvmpipe \
+            target/release/gput-packet-demo
+
+          env \
+            WGPU_BACKEND=vulkan \
+            VK_DRIVER_FILES="$lvp_icd" \
+            VK_ICD_FILENAMES="$lvp_icd" \
+            XDG_RUNTIME_DIR="$runtime_dir" \
+            LIBGL_ALWAYS_SOFTWARE=true \
+            GALLIUM_DRIVER=llvmpipe \
+            target/release/gput-packet-bench \
+              --backend both \
+              --flows 64 \
+              --requests-per-flow 4 \
+              --warmup-requests-per-flow 1 \
+              --batch-size 32 \
+              --flow-capacity 256 \
+              --flow-probe-limit 64 \
+              --json > packet-proof.json
+
+          python3 - <<'PY'
+          import json
+
+          with open("packet-proof.json", encoding="utf-8") as result_file:
+              proof = json.load(result_file)
+
+          results = {row["backend"]: row for row in proof["results"]}
+          assert set(results) == {"cpu-packet", "gpu-packet"}, proof
+          for row in results.values():
+              assert row["requests"] == 256, row
+              assert row["engine_requests_per_second"] > 0, row
+              assert row["end_to_end_requests_per_second"] > 0, row
+              assert row["p99_round_nanos"] > 0, row
+              assert row["packets"] >= row["requests"], row
+          PY
+
+          cat packet-proof.json
+
+      - name: Publish packet proof status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROOF_OUTCOME: ${{ steps.proof.outcome }}
+        shell: bash
+        run: |
+          if [[ "$PROOF_OUTCOME" == success ]]; then
+            state=success
+            description="CPU/GPU packet parity, collisions, retransmits and benchmark passed"
+          else
+            state=failure
+            description="CPU/GPU packet proof failed; inspect the linked run"
+          fi
+
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state="$state" \
+            -f context="gput/packet-proof" \
+            -f description="$description" \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Fail when the proof failed
+        if: always() && steps.proof.outcome != 'success'
+        run: exit 1
