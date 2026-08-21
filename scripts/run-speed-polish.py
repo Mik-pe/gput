@@ -35,3 +35,27 @@ if ci_marker not in source:
     raise SystemExit("speed-polish CI tail marker did not match")
 source = source.split(ci_marker, 1)[0] + "\n"
 exec(compile(source, str(path), "exec"))
+
+batcher = Path("src/batcher.rs")
+batcher_source = batcher.read_text()
+old_order = """        jobs.clear();
+        requests.clear();
+        jobs.push(first);
+"""
+new_order = """        requests.clear();
+        jobs.clear();
+        jobs.push(first);
+"""
+if old_order not in batcher_source:
+    raise SystemExit("batcher reset order did not match")
+batcher_source = batcher_source.replace(old_order, new_order, 1)
+old_call = """        requests.extend(jobs.iter().map(|job| job.request.as_slice()));
+        let result = processor.process_batch(&requests);
+"""
+new_call = """        requests.extend(jobs.iter().map(|job| job.request.as_slice()));
+        let result = processor.process_batch(&requests);
+        requests.clear();
+"""
+if old_call not in batcher_source:
+    raise SystemExit("batcher processor call did not match")
+batcher.write_text(batcher_source.replace(old_call, new_call, 1))
