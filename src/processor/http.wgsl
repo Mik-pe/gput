@@ -2,6 +2,10 @@ struct Params {
     request_stride_words: u32,
     response_stride_words: u32,
     request_count: u32,
+    route_count: u32,
+    fallback_response_offset: u32,
+    bad_request_response_offset: u32,
+    method_not_allowed_response_offset: u32,
     _padding: u32,
 };
 
@@ -40,6 +44,17 @@ struct Utf8Scalar {
     _padding: u32,
 };
 
+struct RequestTarget {
+    path_start: u32,
+    path_len: u32,
+    query_start: u32,
+    query_len: u32,
+    path_hash: u32,
+    input_len: u32,
+    valid: u32,
+    _padding: u32,
+};
+
 @group(0) @binding(0)
 var<uniform> params: Params;
 
@@ -61,24 +76,30 @@ var<storage, read> string_meta: array<StringMeta>;
 @group(0) @binding(6)
 var<storage, read> string_words: array<u32>;
 
+@group(0) @binding(7)
+var<storage, read> router_words: array<u32>;
+
 const FNV_OFFSET_BASIS: u32 = 2166136261u;
 const FNV_PRIME: u32 = 16777619u;
 
-const ROOT_PATH_HASH: u32 = 705468254u;
-const HEALTH_PATH_HASH: u32 = 1923151932u;
-const HELLO_PATH_HASH: u32 = 4088401502u;
-const UTF8_PATH_HASH: u32 = 1582453113u;
+const ROUTE_PATH_HASH: u32 = 0u;
+const ROUTE_PATH_LEN: u32 = 1u;
+const ROUTE_PATH_STRING: u32 = 2u;
+const ROUTE_RESPONSE_OFFSET: u32 = 3u;
 
-const RESPONSE_ROOT_ID: u32 = 0u;
-const RESPONSE_HEALTH_ID: u32 = 1u;
-const RESPONSE_HELLO_ID: u32 = 2u;
-const RESPONSE_UTF8_ID: u32 = 3u;
-const RESPONSE_BAD_REQUEST_ID: u32 = 4u;
-const RESPONSE_METHOD_NOT_ALLOWED_ID: u32 = 5u;
-const RESPONSE_NOT_FOUND_ID: u32 = 6u;
+const RESPONSE_STATUS: u32 = 0u;
+const RESPONSE_REASON_STRING: u32 = 1u;
+const RESPONSE_CONTENT_TYPE_STRING: u32 = 2u;
+const RESPONSE_PROGRAM_OFFSET: u32 = 3u;
+const RESPONSE_PROGRAM_LEN: u32 = 4u;
+
+const BODY_OP_CODE: u32 = 0u;
+const BODY_OP_ARG_0: u32 = 1u;
+const BODY_OP_ARG_1: u32 = 2u;
 
 const RESPONSE_FLAG_OUTPUT_OVERFLOW: u32 = 1u;
 const RESPONSE_FLAG_INVALID_UTF8: u32 = 2u;
+const RESPONSE_FLAG_INVALID_PROGRAM: u32 = 4u;
 
 fn request_byte(request_index: u32, byte_index: u32) -> u32 {
     let word_index = request_index * params.request_stride_words + byte_index / 4u;
@@ -91,6 +112,18 @@ fn string_byte(string_id: u32, byte_index: u32) -> u32 {
     let word = string_words[absolute_index / 4u];
     let shift = (absolute_index & 3u) * 8u;
     return (word >> shift) & 255u;
+}
+
+fn route_word(route_index: u32, field: u32) -> u32 {
+    return router_words[route_index * ROUTE_STRIDE_WORDS + field];
+}
+
+fn response_word(response_offset: u32, field: u32) -> u32 {
+    return router_words[response_offset + field];
+}
+
+fn body_op_word(program_offset: u32, operation_index: u32, field: u32) -> u32 {
+    return router_words[program_offset + operation_index * BODY_OP_WORDS + field];
 }
 
 fn writer_new(request_index: u32) -> Writer {
@@ -126,6 +159,27 @@ fn writer_push_string(writer: ptr<function, Writer>, string_id: u32) {
     for (var byte_index = 0u; byte_index < byte_len; byte_index = byte_index + 1u) {
         writer_push_byte(writer, string_byte(string_id, byte_index));
     }
+}
+
+fn writer_push_request_range(
+    writer: ptr<function, Writer>,
+    request_index: u32,
+    byte_start: u32,
+    byte_len: u32,
+) {
+    for (var byte_index = 0u; byte_index < byte_len; byte_index = byte_index + 1u) {
+        writer_push_byte(writer, request_byte(request_index, byte_start + byte_index));
+    }
+}
+
+fn decimal_width(value: u32) -> u32 {
+    var width = 1u;
+    var remaining = value;
+    while (remaining >= 10u) {
+        remaining = remaining / 10u;
+        width = width + 1u;
+    }
+    return width;
 }
 
 fn writer_push_decimal(writer: ptr<function, Writer>, value: u32) {
@@ -343,101 +397,21 @@ fn has_supported_http_version(request_index: u32, version_start: u32, input_len:
         && request_byte(request_index, version_start + 9u) == 10u;
 }
 
-fn response_status_string(response_id: u32) -> u32 {
-    switch response_id {
-        case RESPONSE_ROOT_ID, RESPONSE_HEALTH_ID, RESPONSE_HELLO_ID, RESPONSE_UTF8_ID: {
-            return STRING_STATUS_OK;
-        }
-        case RESPONSE_BAD_REQUEST_ID: { return STRING_STATUS_BAD_REQUEST; }
-        case RESPONSE_METHOD_NOT_ALLOWED_ID: { return STRING_STATUS_METHOD_NOT_ALLOWED; }
-        case RESPONSE_NOT_FOUND_ID: { return STRING_STATUS_NOT_FOUND; }
-        default: { return STRING_STATUS_NOT_FOUND; }
-    }
+fn invalid_target(input_len: u32) -> RequestTarget {
+    return RequestTarget(0u, 0u, 0u, 0u, 0u, input_len, 0u, 0u);
 }
 
-fn response_status(response_id: u32) -> u32 {
-    switch response_id {
-        case RESPONSE_ROOT_ID, RESPONSE_HEALTH_ID, RESPONSE_HELLO_ID, RESPONSE_UTF8_ID: {
-            return 200u;
-        }
-        case RESPONSE_BAD_REQUEST_ID: { return 400u; }
-        case RESPONSE_METHOD_NOT_ALLOWED_ID: { return 405u; }
-        case RESPONSE_NOT_FOUND_ID: { return 404u; }
-        default: { return 404u; }
-    }
-}
-
-fn response_content_type(response_id: u32) -> u32 {
-    if (response_id == RESPONSE_ROOT_ID) {
-        return STRING_CONTENT_TYPE_JSON;
-    }
-    return STRING_CONTENT_TYPE_TEXT;
-}
-
-fn response_body(response_id: u32) -> u32 {
-    switch response_id {
-        case RESPONSE_ROOT_ID: { return STRING_BODY_ROOT; }
-        case RESPONSE_HEALTH_ID: { return STRING_BODY_HEALTH; }
-        case RESPONSE_HELLO_ID: { return STRING_BODY_HELLO; }
-        case RESPONSE_UTF8_ID: { return STRING_BODY_UTF8; }
-        case RESPONSE_BAD_REQUEST_ID: { return STRING_BODY_BAD_REQUEST; }
-        case RESPONSE_METHOD_NOT_ALLOWED_ID: { return STRING_BODY_METHOD_NOT_ALLOWED; }
-        case RESPONSE_NOT_FOUND_ID: { return STRING_BODY_NOT_FOUND; }
-        default: { return STRING_BODY_NOT_FOUND; }
-    }
-}
-
-fn write_response(request_index: u32, response_id: u32) {
-    let status_string_id = response_status_string(response_id);
-    let content_type_id = response_content_type(response_id);
-    let body_id = response_body(response_id);
-    let body_len = string_meta[body_id].byte_len;
-    var writer = writer_new(request_index);
-
-    writer_push_string(&writer, STRING_HTTP_VERSION);
-    writer_push_string(&writer, status_string_id);
-    writer_push_string(&writer, STRING_HEADER_CONTENT_TYPE);
-    writer_push_string(&writer, content_type_id);
-    writer_push_string(&writer, STRING_HEADER_CONTENT_LENGTH);
-    writer_push_decimal(&writer, body_len);
-    writer_push_string(&writer, STRING_HEADER_TAIL);
-
-    if (response_id == RESPONSE_UTF8_ID) {
-        writer_push_utf8_string(&writer, body_id);
-    } else {
-        writer_push_string(&writer, body_id);
-    }
-
-    writer_finish(writer, response_status(response_id));
-}
-
-@compute @workgroup_size(64)
-fn process_requests(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let request_index = global_id.x;
-    if (request_index >= params.request_count) {
-        return;
-    }
-
-    let input_len = request_meta[request_index].input_len;
-    if (input_len < 4u) {
-        write_response(request_index, RESPONSE_BAD_REQUEST_ID);
-        return;
-    }
-
-    if (!is_get_request(request_index, input_len)) {
-        write_response(request_index, RESPONSE_METHOD_NOT_ALLOWED_ID);
-        return;
-    }
-
+fn parse_get_target(request_index: u32, input_len: u32) -> RequestTarget {
     if (input_len <= 4u || request_byte(request_index, 4u) != 47u) {
-        write_response(request_index, RESPONSE_BAD_REQUEST_ID);
-        return;
+        return invalid_target(input_len);
     }
 
     var cursor = 4u;
     var path_hash = FNV_OFFSET_BASIS;
     var path_len = 0u;
-    var hashing_path = true;
+    var query_start = 0u;
+    var query_len = 0u;
+    var in_query = false;
     var found_target_end = false;
 
     loop {
@@ -451,39 +425,252 @@ fn process_requests(@builtin(global_invocation_id) global_id: vec3<u32>) {
             break;
         }
 
-        if (hashing_path) {
+        if (!in_query) {
             if (byte == 63u) {
-                hashing_path = false;
+                in_query = true;
+                query_start = cursor + 1u;
             } else {
                 path_hash = (path_hash ^ byte) * FNV_PRIME;
                 path_len = path_len + 1u;
             }
+        } else {
+            query_len = query_len + 1u;
         }
 
         cursor = cursor + 1u;
     }
 
     if (!found_target_end || path_len == 0u) {
-        write_response(request_index, RESPONSE_BAD_REQUEST_ID);
-        return;
+        return invalid_target(input_len);
     }
 
     let version_start = cursor + 1u;
     if (!has_supported_http_version(request_index, version_start, input_len)) {
-        write_response(request_index, RESPONSE_BAD_REQUEST_ID);
+        return invalid_target(input_len);
+    }
+
+    if (!in_query) {
+        query_start = cursor;
+    }
+
+    return RequestTarget(
+        4u,
+        path_len,
+        query_start,
+        query_len,
+        path_hash,
+        input_len,
+        1u,
+        0u,
+    );
+}
+
+fn route_matches(request_index: u32, request_target: RequestTarget, route_index: u32) -> bool {
+    if (route_word(route_index, ROUTE_PATH_HASH) != request_target.path_hash
+        || route_word(route_index, ROUTE_PATH_LEN) != request_target.path_len)
+    {
+        return false;
+    }
+
+    let route_string_id = route_word(route_index, ROUTE_PATH_STRING);
+    for (var byte_index = 0u; byte_index < request_target.path_len; byte_index = byte_index + 1u) {
+        if (request_byte(request_index, request_target.path_start + byte_index)
+            != string_byte(route_string_id, byte_index))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+fn find_response_offset(request_index: u32, request_target: RequestTarget) -> u32 {
+    var lower = 0u;
+    var upper = params.route_count;
+
+    while (lower < upper) {
+        let middle = lower + (upper - lower) / 2u;
+        let route_hash = route_word(middle, ROUTE_PATH_HASH);
+        if (route_hash < request_target.path_hash) {
+            lower = middle + 1u;
+        } else {
+            upper = middle;
+        }
+    }
+
+    var route_index = lower;
+    loop {
+        if (route_index >= params.route_count) {
+            break;
+        }
+        if (route_word(route_index, ROUTE_PATH_HASH) != request_target.path_hash) {
+            break;
+        }
+        if (route_matches(request_index, request_target, route_index)) {
+            return route_word(route_index, ROUTE_RESPONSE_OFFSET);
+        }
+        route_index = route_index + 1u;
+    }
+
+    return params.fallback_response_offset;
+}
+
+fn response_body_len(response_offset: u32, request_target: RequestTarget) -> u32 {
+    let program_offset = response_word(response_offset, RESPONSE_PROGRAM_OFFSET);
+    let operation_count = response_word(response_offset, RESPONSE_PROGRAM_LEN);
+    var body_len = 0u;
+
+    for (
+        var operation_index = 0u;
+        operation_index < operation_count;
+        operation_index = operation_index + 1u
+    ) {
+        let opcode = body_op_word(program_offset, operation_index, BODY_OP_CODE);
+        let arg_0 = body_op_word(program_offset, operation_index, BODY_OP_ARG_0);
+        let arg_1 = body_op_word(program_offset, operation_index, BODY_OP_ARG_1);
+
+        switch opcode {
+            case BODY_OP_LITERAL: {
+                body_len = body_len + string_meta[arg_0].byte_len;
+            }
+            case BODY_OP_PATH: {
+                body_len = body_len + min(request_target.path_len, arg_0);
+            }
+            case BODY_OP_QUERY: {
+                body_len = body_len + min(request_target.query_len, arg_0);
+            }
+            case BODY_OP_BACKEND: {
+                body_len = body_len + string_meta[STRING_BACKEND_GPU].byte_len;
+            }
+            case BODY_OP_REQUEST_BYTES: {
+                body_len = body_len + decimal_width(request_target.input_len);
+            }
+            case BODY_OP_PATH_HASH: {
+                body_len = body_len + decimal_width(request_target.path_hash);
+            }
+            case BODY_OP_BACKEND_VARIANT: {
+                body_len = body_len + string_meta[arg_1].byte_len;
+            }
+            default: {}
+        }
+    }
+
+    return body_len;
+}
+
+fn write_response_body(
+    writer: ptr<function, Writer>,
+    request_index: u32,
+    response_offset: u32,
+    request_target: RequestTarget,
+) {
+    let program_offset = response_word(response_offset, RESPONSE_PROGRAM_OFFSET);
+    let operation_count = response_word(response_offset, RESPONSE_PROGRAM_LEN);
+
+    for (
+        var operation_index = 0u;
+        operation_index < operation_count;
+        operation_index = operation_index + 1u
+    ) {
+        let opcode = body_op_word(program_offset, operation_index, BODY_OP_CODE);
+        let arg_0 = body_op_word(program_offset, operation_index, BODY_OP_ARG_0);
+        let arg_1 = body_op_word(program_offset, operation_index, BODY_OP_ARG_1);
+
+        switch opcode {
+            case BODY_OP_LITERAL: {
+                writer_push_utf8_string(writer, arg_0);
+            }
+            case BODY_OP_PATH: {
+                writer_push_request_range(
+                    writer,
+                    request_index,
+                    request_target.path_start,
+                    min(request_target.path_len, arg_0),
+                );
+            }
+            case BODY_OP_QUERY: {
+                writer_push_request_range(
+                    writer,
+                    request_index,
+                    request_target.query_start,
+                    min(request_target.query_len, arg_0),
+                );
+            }
+            case BODY_OP_BACKEND: {
+                writer_push_string(writer, STRING_BACKEND_GPU);
+            }
+            case BODY_OP_REQUEST_BYTES: {
+                writer_push_decimal(writer, request_target.input_len);
+            }
+            case BODY_OP_PATH_HASH: {
+                writer_push_decimal(writer, request_target.path_hash);
+            }
+            case BODY_OP_BACKEND_VARIANT: {
+                writer_push_utf8_string(writer, arg_1);
+            }
+            default: {
+                writer_fail(writer, RESPONSE_FLAG_INVALID_PROGRAM);
+            }
+        }
+    }
+}
+
+fn write_response(
+    request_index: u32,
+    response_offset: u32,
+    request_target: RequestTarget,
+) {
+    let status = response_word(response_offset, RESPONSE_STATUS);
+    let reason_string_id = response_word(response_offset, RESPONSE_REASON_STRING);
+    let content_type_string_id = response_word(response_offset, RESPONSE_CONTENT_TYPE_STRING);
+    let body_len = response_body_len(response_offset, request_target);
+    var writer = writer_new(request_index);
+
+    writer_push_string(&writer, STRING_HTTP_VERSION);
+    writer_push_decimal(&writer, status);
+    writer_push_byte(&writer, 32u);
+    writer_push_string(&writer, reason_string_id);
+    writer_push_string(&writer, STRING_HEADER_CONTENT_TYPE);
+    writer_push_string(&writer, content_type_string_id);
+    writer_push_string(&writer, STRING_HEADER_CONTENT_LENGTH);
+    writer_push_decimal(&writer, body_len);
+    writer_push_string(&writer, STRING_HEADER_TAIL);
+    write_response_body(&writer, request_index, response_offset, request_target);
+    writer_finish(writer, status);
+}
+
+@compute @workgroup_size(64)
+fn process_requests(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let request_index = global_id.x;
+    if (request_index >= params.request_count) {
         return;
     }
 
-    var response_id = RESPONSE_NOT_FOUND_ID;
-    if (path_len == 1u && path_hash == ROOT_PATH_HASH) {
-        response_id = RESPONSE_ROOT_ID;
-    } else if (path_len == 7u && path_hash == HEALTH_PATH_HASH) {
-        response_id = RESPONSE_HEALTH_ID;
-    } else if (path_len == 6u && path_hash == HELLO_PATH_HASH) {
-        response_id = RESPONSE_HELLO_ID;
-    } else if (path_len == 5u && path_hash == UTF8_PATH_HASH) {
-        response_id = RESPONSE_UTF8_ID;
+    let input_len = request_meta[request_index].input_len;
+    if (input_len < 4u) {
+        write_response(
+            request_index,
+            params.bad_request_response_offset,
+            invalid_target(input_len),
+        );
+        return;
     }
 
-    write_response(request_index, response_id);
+    if (!is_get_request(request_index, input_len)) {
+        write_response(
+            request_index,
+            params.method_not_allowed_response_offset,
+            invalid_target(input_len),
+        );
+        return;
+    }
+
+    let request_target = parse_get_target(request_index, input_len);
+    if (request_target.valid == 0u) {
+        write_response(request_index, params.bad_request_response_offset, request_target);
+        return;
+    }
+
+    let response_offset = find_response_offset(request_index, request_target);
+    write_response(request_index, response_offset, request_target);
 }

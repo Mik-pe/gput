@@ -1,7 +1,11 @@
 #[cfg(target_endian = "big")]
 compile_error!("gput's GPU byte packing currently requires a little-endian host");
 
-use std::{mem::size_of, num::NonZeroU64, sync::mpsc};
+use std::{
+    mem::size_of,
+    num::NonZeroU64,
+    sync::{Arc, mpsc},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytemuck::{Pod, Zeroable};
@@ -11,10 +15,14 @@ use super::{
     Processor, ProcessorLimits,
     shader_strings::{StringMeta, build_shader_assets},
 };
+use crate::{
+    builtin_router,
+    router::{CompiledRouter, GpuRouterLayout, Router},
+};
 
 const SHADER_BODY: &str = include_str!("http.wgsl");
 const WORKGROUP_SIZE: u32 = 64;
-const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 6;
+const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 7;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -22,6 +30,10 @@ struct Params {
     request_stride_words: u32,
     response_stride_words: u32,
     request_count: u32,
+    route_count: u32,
+    fallback_response_offset: u32,
+    bad_request_response_offset: u32,
+    method_not_allowed_response_offset: u32,
     _padding: u32,
 }
 
@@ -56,8 +68,10 @@ pub struct GpuProcessor {
     output_buffer: wgpu::Buffer,
     _string_meta_buffer: wgpu::Buffer,
     _string_words_buffer: wgpu::Buffer,
+    _router_words_buffer: wgpu::Buffer,
     response_meta_readback: wgpu::Buffer,
     output_readback: wgpu::Buffer,
+    router_layout: GpuRouterLayout,
     max_batch_size: usize,
     max_request_bytes: usize,
     request_stride_words: usize,
@@ -66,7 +80,20 @@ pub struct GpuProcessor {
 
 impl GpuProcessor {
     pub fn new(limits: ProcessorLimits) -> Result<Self> {
-        let shader_assets = build_shader_assets(SHADER_BODY)?;
+        Self::with_router(limits, builtin_router())
+    }
+
+    pub fn with_router(limits: ProcessorLimits, router: Router) -> Result<Self> {
+        let router = Arc::new(router.compile()?);
+        router.validate_gpu_response_slot(limits.response_slot_bytes)?;
+        Self::from_compiled(limits, router)
+    }
+
+    pub(crate) fn from_compiled(
+        limits: ProcessorLimits,
+        router: Arc<CompiledRouter>,
+    ) -> Result<Self> {
+        let shader_assets = build_shader_assets(SHADER_BODY, router.as_ref())?;
         let request_stride_words = words_for_bytes(limits.max_request_bytes)?;
         let response_stride_words = words_for_bytes(limits.response_slot_bytes)?;
         let request_meta_bytes = checked_buffer_bytes(
@@ -97,6 +124,11 @@ impl GpuProcessor {
         let string_words_bytes = checked_buffer_bytes(
             "shader string arena",
             shader_assets.words.len(),
+            size_of::<u32>(),
+        )?;
+        let router_words_bytes = checked_buffer_bytes(
+            "GPU router program",
+            router.router_words().len(),
             size_of::<u32>(),
         )?;
 
@@ -186,6 +218,12 @@ impl GpuProcessor {
                     false,
                     size_of::<u32>(),
                 ),
+                buffer_layout_entry(
+                    7,
+                    wgpu::BufferBindingType::Storage { read_only: true },
+                    false,
+                    size_of::<u32>(),
+                ),
             ],
         });
 
@@ -245,6 +283,12 @@ impl GpuProcessor {
             string_words_bytes,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
+        let router_words_buffer = create_buffer(
+            &device,
+            "gput-router-program",
+            router_words_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
         let response_meta_readback = create_buffer(
             &device,
             "gput-response-meta-readback",
@@ -267,6 +311,11 @@ impl GpuProcessor {
             &string_words_buffer,
             0,
             bytemuck::cast_slice(&shader_assets.words),
+        );
+        queue.write_buffer(
+            &router_words_buffer,
+            0,
+            bytemuck::cast_slice(router.router_words()),
         );
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -301,9 +350,14 @@ impl GpuProcessor {
                     binding: 6,
                     resource: string_words_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: router_words_buffer.as_entire_binding(),
+                },
             ],
         });
 
+        let router_layout = router.gpu_layout();
         info!(
             adapter = %adapter_info.name,
             backend = ?adapter_info.backend,
@@ -311,6 +365,9 @@ impl GpuProcessor {
             max_batch_size = limits.max_batch_size,
             request_slot_bytes = request_stride_words * size_of::<u32>(),
             response_slot_bytes = response_stride_words * size_of::<u32>(),
+            max_router_response_bytes = router.max_gpu_response_bytes(),
+            routes = router_layout.route_count,
+            router_words = router.router_words().len(),
             shader_strings = shader_assets.metadata.len(),
             shader_string_bytes = shader_assets.byte_len,
             "using GPU compute processor"
@@ -329,8 +386,10 @@ impl GpuProcessor {
             output_buffer,
             _string_meta_buffer: string_meta_buffer,
             _string_words_buffer: string_words_buffer,
+            _router_words_buffer: router_words_buffer,
             response_meta_readback,
             output_readback,
+            router_layout,
             max_batch_size: limits.max_batch_size,
             max_request_bytes: limits.max_request_bytes,
             request_stride_words,
@@ -385,6 +444,12 @@ impl GpuProcessor {
                 .context("response stride does not fit u32")?,
             request_count: u32::try_from(request_count)
                 .context("request count does not fit u32")?,
+            route_count: self.router_layout.route_count,
+            fallback_response_offset: self.router_layout.fallback_response_offset,
+            bad_request_response_offset: self.router_layout.bad_request_response_offset,
+            method_not_allowed_response_offset: self
+                .router_layout
+                .method_not_allowed_response_offset,
             _padding: 0,
         };
 
@@ -611,6 +676,7 @@ fn pack_request_words(request: &[u8], destination: &mut [u32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtin_router;
 
     #[test]
     fn packs_bytes_little_endian_for_wgsl_extraction() {
@@ -623,7 +689,8 @@ mod tests {
 
     #[test]
     fn composed_shader_parses_and_validates() {
-        let assets = build_shader_assets(SHADER_BODY).expect("shader assets build");
+        let router = builtin_router().compile().expect("router compiles");
+        let assets = build_shader_assets(SHADER_BODY, &router).expect("shader assets build");
         let module = naga::front::wgsl::parse_str(&assets.source).expect("WGSL must parse");
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),

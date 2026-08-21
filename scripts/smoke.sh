@@ -135,6 +135,40 @@ curl --silent --show-error --fail "$base_url/health?probe=smoke" \
   >"$work_dir/query-body"
 cmp "$work_dir/expected-health" "$work_dir/query-body"
 
+curl --silent --show-error --fail \
+  --dump-header "$work_dir/inspect-headers" \
+  --output "$work_dir/inspect-body" \
+  "$base_url/inspect?owl=yes"
+tr -d '\r' <"$work_dir/inspect-headers" >"$work_dir/inspect-headers-clean"
+grep --fixed-strings --line-regexp "X-Gput-Backend: $backend" \
+  "$work_dir/inspect-headers-clean" >/dev/null
+
+INSPECT_HEADERS="$work_dir/inspect-headers" \
+INSPECT_BODY="$work_dir/inspect-body" \
+INSPECT_BACKEND="$backend" \
+python3 - <<'PY'
+import os
+from pathlib import Path
+
+headers = Path(os.environ["INSPECT_HEADERS"]).read_bytes().replace(b"\r\n", b"\n")
+body = Path(os.environ["INSPECT_BODY"]).read_bytes()
+lines = body.decode("utf-8").splitlines()
+
+assert lines[0] == "path=/inspect", lines
+assert lines[1] == "query=owl=yes", lines
+assert lines[2].startswith("request_bytes="), lines
+assert int(lines[2].removeprefix("request_bytes=")) > 0, lines
+assert lines[3] == "path_hash=3938772546", lines
+assert lines[4] == f"backend={os.environ['INSPECT_BACKEND']}", lines
+
+content_length = next(
+    int(line.removeprefix(b"Content-Length: "))
+    for line in headers.splitlines()
+    if line.startswith(b"Content-Length: ")
+)
+assert content_length == len(body), (content_length, len(body))
+PY
+
 not_found_status="$(
   curl --silent --show-error \
     --output "$work_dir/not-found-body" \
@@ -168,6 +202,7 @@ cases = [
     (b"GET /health HTTP/1.0\r\n\r\n", b"HTTP/1.1 200 OK\r\n"),
     (b"GET /hello?source=raw HTTP/1.1\r\nHost: smoke\r\n\r\n", b"HTTP/1.1 200 OK\r\n"),
     (b"GET /utf8?source=raw HTTP/1.1\r\nHost: smoke\r\n\r\n", b"HTTP/1.1 200 OK\r\n"),
+    (b"GET /inspect?raw=yes HTTP/1.1\r\nHost: smoke\r\n\r\n", b"HTTP/1.1 200 OK\r\n"),
     (b"GET / GPUT/6.6\r\n\r\n", b"HTTP/1.1 400 Bad Request\r\n"),
     (b"GET / HTTP/1.1\rX\nHost: smoke\r\n\r\n", b"HTTP/1.1 400 Bad Request\r\n"),
     (b"POST / HTTP/1.1\r\n\r\n", b"HTTP/1.1 405 Method Not Allowed\r\n"),

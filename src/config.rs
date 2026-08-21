@@ -3,12 +3,20 @@ use std::{net::SocketAddr, time::Duration};
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 
-use crate::protocol::MAX_GPU_RESPONSE_BYTES;
+use crate::protocol::MIN_GPU_RESPONSE_SLOT_BYTES;
 
 const MAX_TOTAL_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_BATCH_SIZE: usize = 256;
+const DEFAULT_BATCH_WAIT_MICROS: u64 = 50;
+const DEFAULT_QUEUE_DEPTH: usize = 8_192;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 4_096;
+const DEFAULT_RESPONSE_SLOT_BYTES: usize = 512;
+const DEFAULT_MAX_CONNECTIONS: usize = 4_096;
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum BackendChoice {
+    #[default]
     Auto,
     Cpu,
     Gpu,
@@ -18,7 +26,7 @@ pub enum BackendChoice {
 #[command(
     name = "gput",
     version,
-    about = "An HTTP server that makes the GPU parse requests for no defensible reason"
+    about = "An HTTP server that makes the GPU parse and route requests for no defensible reason"
 )]
 pub struct Cli {
     #[arg(long, env = "GPUT_BIND", default_value = "127.0.0.1:8080")]
@@ -27,25 +35,45 @@ pub struct Cli {
     #[arg(long, env = "GPUT_BACKEND", value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
 
-    #[arg(long, env = "GPUT_BATCH_SIZE", default_value_t = 256)]
+    #[arg(long, env = "GPUT_BATCH_SIZE", default_value_t = DEFAULT_BATCH_SIZE)]
     pub batch_size: usize,
 
-    #[arg(long, env = "GPUT_BATCH_WAIT_MICROS", default_value_t = 50)]
+    #[arg(
+        long,
+        env = "GPUT_BATCH_WAIT_MICROS",
+        default_value_t = DEFAULT_BATCH_WAIT_MICROS
+    )]
     pub batch_wait_micros: u64,
 
-    #[arg(long, env = "GPUT_QUEUE_DEPTH", default_value_t = 8_192)]
+    #[arg(long, env = "GPUT_QUEUE_DEPTH", default_value_t = DEFAULT_QUEUE_DEPTH)]
     pub queue_depth: usize,
 
-    #[arg(long, env = "GPUT_MAX_REQUEST_BYTES", default_value_t = 4_096)]
+    #[arg(
+        long,
+        env = "GPUT_MAX_REQUEST_BYTES",
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES
+    )]
     pub max_request_bytes: usize,
 
-    #[arg(long, env = "GPUT_RESPONSE_SLOT_BYTES", default_value_t = 256)]
+    #[arg(
+        long,
+        env = "GPUT_RESPONSE_SLOT_BYTES",
+        default_value_t = DEFAULT_RESPONSE_SLOT_BYTES
+    )]
     pub response_slot_bytes: usize,
 
-    #[arg(long, env = "GPUT_MAX_CONNECTIONS", default_value_t = 4_096)]
+    #[arg(
+        long,
+        env = "GPUT_MAX_CONNECTIONS",
+        default_value_t = DEFAULT_MAX_CONNECTIONS
+    )]
     pub max_connections: usize,
 
-    #[arg(long, env = "GPUT_READ_TIMEOUT_SECS", default_value_t = 5)]
+    #[arg(
+        long,
+        env = "GPUT_READ_TIMEOUT_SECS",
+        default_value_t = DEFAULT_READ_TIMEOUT_SECS
+    )]
     pub read_timeout_secs: u64,
 }
 
@@ -60,6 +88,22 @@ pub struct ServerConfig {
     pub response_slot_bytes: usize,
     pub max_connections: usize,
     pub read_timeout: Duration,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            backend: BackendChoice::Auto,
+            batch_size: DEFAULT_BATCH_SIZE,
+            batch_wait: Duration::from_micros(DEFAULT_BATCH_WAIT_MICROS),
+            queue_depth: DEFAULT_QUEUE_DEPTH,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            response_slot_bytes: DEFAULT_RESPONSE_SLOT_BYTES,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            read_timeout: Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS),
+        }
+    }
 }
 
 impl TryFrom<Cli> for ServerConfig {
@@ -105,10 +149,8 @@ impl ServerConfig {
             bail!("--max-request-bytes must be at least 16");
         }
 
-        if self.response_slot_bytes < MAX_GPU_RESPONSE_BYTES {
-            bail!(
-                "--response-slot-bytes must be at least {MAX_GPU_RESPONSE_BYTES} for the built-in routes"
-            );
+        if self.response_slot_bytes < MIN_GPU_RESPONSE_SLOT_BYTES {
+            bail!("--response-slot-bytes must be at least {MIN_GPU_RESPONSE_SLOT_BYTES}");
         }
 
         if self.max_connections == 0 {
@@ -157,37 +199,27 @@ fn round_up_to_word(value: usize) -> Result<usize> {
 mod tests {
     use super::*;
 
-    fn valid_config() -> ServerConfig {
-        ServerConfig {
-            bind: "127.0.0.1:8080".parse().expect("valid address"),
-            backend: BackendChoice::Auto,
-            batch_size: 256,
-            batch_wait: Duration::from_micros(50),
-            queue_depth: 8_192,
-            max_request_bytes: 4_096,
-            response_slot_bytes: 256,
-            max_connections: 4_096,
-            read_timeout: Duration::from_secs(5),
-        }
-    }
-
     #[test]
     fn accepts_default_shape() {
-        valid_config().validate().expect("default config is valid");
+        ServerConfig::default()
+            .validate()
+            .expect("default config is valid");
     }
 
     #[test]
     fn rejects_queue_smaller_than_batch() {
-        let mut config = valid_config();
+        let mut config = ServerConfig::default();
         config.queue_depth = config.batch_size - 1;
 
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn rejects_response_slots_that_cannot_hold_builtins() {
-        let mut config = valid_config();
-        config.response_slot_bytes = MAX_GPU_RESPONSE_BYTES - 1;
+    fn rejects_response_slots_below_the_absolute_minimum() {
+        let config = ServerConfig {
+            response_slot_bytes: MIN_GPU_RESPONSE_SLOT_BYTES - 1,
+            ..ServerConfig::default()
+        };
 
         assert!(config.validate().is_err());
     }
