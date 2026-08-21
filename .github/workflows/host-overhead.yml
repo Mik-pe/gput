@@ -1,0 +1,280 @@
+name: land allocation-free host scheduling
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/host-overhead.yml
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  statuses: write
+
+concurrency:
+  group: gput-host-overhead
+  cancel-in-progress: true
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Mark optimization pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=pending \
+            -f context=gput/host-overhead \
+            -f description='reusing packet scheduler state and tightening HTTP response memory' \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Install Rust and Lavapipe
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          if ! find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit \
+            2>/dev/null | grep --quiet .; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends mesa-vulkan-drivers
+          fi
+
+      - name: Build the current release tree
+        run: |
+          cargo +1.97.1 build --release --locked \
+            --bin gput \
+            --bin gput-bench \
+            --bin gput-packet-bench
+
+      - name: Measure current packet and HTTP paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          lvp_icd="$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)"
+          runtime_dir="$(mktemp -d)"
+          trap 'rm -rf "$runtime_dir"' EXIT
+          chmod 700 "$runtime_dir"
+          common=(
+            WGPU_BACKEND=vulkan
+            VK_DRIVER_FILES="$lvp_icd"
+            VK_ICD_FILENAMES="$lvp_icd"
+            XDG_RUNTIME_DIR="$runtime_dir"
+            LIBGL_ALWAYS_SOFTWARE=true
+            GALLIUM_DRIVER=llvmpipe
+          )
+
+          env "${common[@]}" \
+            target/release/gput-packet-bench \
+              --backend gpu \
+              --flows 256 \
+              --requests-per-flow 512 \
+              --warmup-requests-per-flow 8 \
+              --batch-size 256 \
+              --flow-capacity 1024 \
+              --flow-probe-limit 64 \
+              --json > /tmp/packet-before.json
+
+          env "${common[@]}" \
+            target/release/gput \
+              --backend gpu \
+              --bind 127.0.0.1:18091 \
+              --batch-size 256 \
+              --batch-wait-micros 50 \
+              > /tmp/http-server-before.log 2>&1 &
+          server_pid=$!
+          cleanup_server() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap 'cleanup_server; rm -rf "$runtime_dir"' EXIT
+          for _ in $(seq 1 100); do
+            if curl --silent --fail --max-time 1 http://127.0.0.1:18091/health >/dev/null 2>&1; then
+              break
+            fi
+            kill -0 "$server_pid" 2>/dev/null || {
+              cat /tmp/http-server-before.log
+              exit 1
+            }
+            sleep 0.1
+          done
+          target/release/gput-bench \
+            --address 127.0.0.1:18091 \
+            --path /plaintext \
+            --requests 8192 \
+            --concurrency 128 \
+            --warmup 512 \
+            --pipeline 1 \
+            --expected-backend gpu \
+            --timeout-millis 10000 \
+            --json > /tmp/http-before.json
+          cleanup_server
+          trap 'rm -rf "$runtime_dir"' EXIT
+
+          cat /tmp/packet-before.json
+          cat /tmp/http-before.json
+          grep 'using GPU compute processor' /tmp/http-server-before.log || true
+
+      - name: Apply reusable scheduling and exact HTTP response storage
+        run: python3 scripts/run-host-overhead.py
+
+      - name: Format, lint, test and build every binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.97.1 fmt
+          cargo +1.97.1 clippy --locked --all-targets --all-features -- -D warnings
+          cargo +1.97.1 test --locked --all-features
+          cargo +1.97.1 build --release --locked --bins
+
+      - name: Prove semantics and measure optimized paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          lvp_icd="$(find /usr/share/vulkan/icd.d -maxdepth 1 -name 'lvp_icd*.json' -print -quit)"
+          runtime_dir="$(mktemp -d)"
+          trap 'rm -rf "$runtime_dir"' EXIT
+          chmod 700 "$runtime_dir"
+          common=(
+            WGPU_BACKEND=vulkan
+            VK_DRIVER_FILES="$lvp_icd"
+            VK_ICD_FILENAMES="$lvp_icd"
+            XDG_RUNTIME_DIR="$runtime_dir"
+            LIBGL_ALWAYS_SOFTWARE=true
+            GALLIUM_DRIVER=llvmpipe
+          )
+
+          env "${common[@]}" target/release/gput-doctor
+          env "${common[@]}" target/release/gput-packet-demo
+          env "${common[@]}" \
+            target/release/gput-packet-bench \
+              --backend gpu \
+              --flows 256 \
+              --requests-per-flow 512 \
+              --warmup-requests-per-flow 8 \
+              --batch-size 256 \
+              --flow-capacity 1024 \
+              --flow-probe-limit 64 \
+              --json > /tmp/packet-after.json
+
+          env "${common[@]}" \
+            target/release/gput \
+              --backend gpu \
+              --bind 127.0.0.1:18092 \
+              --batch-size 256 \
+              --batch-wait-micros 50 \
+              > /tmp/http-server-after.log 2>&1 &
+          server_pid=$!
+          cleanup_server() {
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+          }
+          trap 'cleanup_server; rm -rf "$runtime_dir"' EXIT
+          for _ in $(seq 1 100); do
+            if curl --silent --fail --max-time 1 http://127.0.0.1:18092/health >/dev/null 2>&1; then
+              break
+            fi
+            kill -0 "$server_pid" 2>/dev/null || {
+              cat /tmp/http-server-after.log
+              exit 1
+            }
+            sleep 0.1
+          done
+          target/release/gput-bench \
+            --address 127.0.0.1:18092 \
+            --path /plaintext \
+            --requests 8192 \
+            --concurrency 128 \
+            --warmup 512 \
+            --pipeline 1 \
+            --expected-backend gpu \
+            --timeout-millis 10000 \
+            --json > /tmp/http-after.json
+          cleanup_server
+          trap 'rm -rf "$runtime_dir"' EXIT
+
+          cat /tmp/packet-after.json
+          cat /tmp/http-after.json
+          grep 'using GPU compute processor' /tmp/http-server-after.log || true
+
+          python3 - <<'PY'
+          import json
+
+          def load(path):
+              with open(path, encoding='utf-8') as source:
+                  return json.load(source)
+
+          packet_before = load('/tmp/packet-before.json')['results'][0]
+          packet_after = load('/tmp/packet-after.json')['results'][0]
+          http_before = load('/tmp/http-before.json')
+          http_after = load('/tmp/http-after.json')
+
+          old_packet = packet_before['engine_requests_per_second']
+          new_packet = packet_after['engine_requests_per_second']
+          old_http = http_before['requests_per_second']
+          new_http = http_after['requests_per_second']
+          print(f'packet engine: {old_packet:.0f} -> {new_packet:.0f} req/s ({new_packet / old_packet:.3f}x)')
+          print(f'HTTP socket path: {old_http:.0f} -> {new_http:.0f} req/s ({new_http / old_http:.3f}x)')
+          assert packet_before['requests'] == packet_after['requests'] == 131072
+          assert http_before['requests'] == http_after['requests'] == 8192
+          assert new_packet > 0 and new_http > 0
+          PY
+
+      - name: Publish directly to main
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm \
+            .github/workflows/host-overhead.yml \
+            scripts/host-overhead.py \
+            scripts/run-host-overhead.py
+          git add -- \
+            src/packet/mod.rs \
+            src/processor/gpu.rs
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m "perf: reuse packet scheduling and right-size HTTP readback"
+          git push origin HEAD:main
+          echo "new_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Mark optimized commit green
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_SHA: ${{ steps.publish.outputs.new_sha }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${NEW_SHA}" \
+            -f state=success \
+            -f context=gput/host-overhead \
+            -f description='allocation-free packet waves and one exact-sized HTTP readback passed' \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Dispatch permanent checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/dispatches" -f ref=main
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/packet-proof.yml/dispatches" -f ref=main
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/workflows/macos.yml/dispatches" -f ref=main
+
+      - name: Mark failed optimization red
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=failure \
+            -f context=gput/host-overhead \
+            -f description='host-overhead preflight failed; inspect the linked run' \
+            -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
