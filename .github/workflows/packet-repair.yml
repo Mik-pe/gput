@@ -36,15 +36,15 @@ jobs:
             -f description='formatting and validating GPU TCP packet engine' \
             -f target_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
-      - name: Apply wgpu 30 readback fix
+      - name: Apply deterministic compiler repairs
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("src/packet/mod.rs")
-          source = path.read_text()
+          packet = Path("src/packet/mod.rs")
+          source = packet.read_text()
           old_signature = "fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<wgpu::BufferView<'_>> {"
           new_signature = "fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<wgpu::BufferView> {"
           if old_signature not in source:
@@ -54,7 +54,14 @@ jobs:
           new_return = "    Ok(slice.get_mapped_range()?)\n"
           if old_return not in source:
               raise SystemExit("expected mapped-range return was not found")
-          path.write_text(source.replace(old_return, new_return, 1))
+          packet.write_text(source.replace(old_return, new_return, 1))
+
+          bench = Path("src/bin/gput-bench.rs")
+          source = bench.read_text()
+          old = "sorted.len() % 2 == 0"
+          if source.count(old) != 2:
+              raise SystemExit("expected exactly two benchmark median parity checks")
+          bench.write_text(source.replace(old, "sorted.len().is_multiple_of(2)"))
           PY
 
       - name: Install Rust 1.97.1
