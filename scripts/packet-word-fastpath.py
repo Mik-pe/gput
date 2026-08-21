@@ -10,7 +10,13 @@ def replace_once(source: str, old: str, new: str, label: str) -> str:
 
 
 def replace_regex(source: str, pattern: str, replacement: str, label: str) -> str:
-    updated, count = re.subn(pattern, replacement, source, count=1, flags=re.DOTALL)
+    updated, count = re.subn(
+        pattern,
+        lambda _match: replacement,
+        source,
+        count=1,
+        flags=re.DOTALL,
+    )
     if count != 1:
         raise SystemExit(f"expected one regex match for {label}, got {count}")
     return updated
@@ -21,7 +27,7 @@ source = packet_path.read_text()
 source = replace_regex(
     source,
     r"fn packet_shader_source\(\) -> Result<String> \{.*?\n\}\n\nfn write_u32_array",
-    '''fn packet_shader_source() -> Result<String> {
+    r'''fn packet_shader_source() -> Result<String> {
     let mut response_bytes = Vec::new();
     let mut response_word_offsets = Vec::with_capacity(PACKET_RESPONSES.len());
     let mut response_word_counts = Vec::with_capacity(PACKET_RESPONSES.len());
