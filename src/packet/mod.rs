@@ -9,6 +9,7 @@ const PACKET_WORDS: usize = MAX_RAW_PACKET_BYTES / 4;
 const FLOW_WORDS: usize = 8;
 const DEFAULT_FLOW_CAPACITY: usize = 4096;
 const WORKGROUP_SIZE: usize = 64;
+const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 5;
 const PACKET_HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 14\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nHello, World!\n";
 
 #[repr(C)]
@@ -75,6 +76,7 @@ impl Default for PacketEngineConfig {
 }
 
 pub struct GpuPacketEngine {
+    _instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -110,29 +112,37 @@ impl GpuPacketEngine {
     }
 
     async fn new_async(config: PacketEngineConfig) -> Result<Self> {
-        let instance = wgpu::Instance::default();
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .context("no compute-capable GPU adapter available for packet engine")?;
         let adapter_info = adapter.get_info();
-        tracing::info!(
-            adapter = %adapter_info.name,
-            backend = ?adapter_info.backend,
-            "initializing GPU-native packet engine"
+        let downlevel_capabilities = adapter.get_downlevel_capabilities();
+        ensure!(
+            downlevel_capabilities
+                .flags
+                .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS),
+            "adapter {} does not support compute shaders",
+            adapter_info.name
         );
 
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        required_limits.max_storage_buffers_per_shader_stage =
+            REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("gput packet engine device"),
+                label: Some("gput-packet-device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::Performance,
+                required_limits,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,
             })
             .await
@@ -140,8 +150,8 @@ impl GpuPacketEngine {
 
         let shader_source = packet_shader_source()?;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gput packet TCP shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            label: Some("gput-packet-tcp-shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.as_str().into()),
         });
 
         let packet_meta_bytes = config
@@ -239,8 +249,8 @@ impl GpuPacketEngine {
         let pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("packet engine pipeline layout"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
             });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("packet engine pipeline"),
@@ -251,7 +261,18 @@ impl GpuPacketEngine {
             cache: None,
         });
 
+        tracing::info!(
+            adapter = %adapter_info.name,
+            backend = ?adapter_info.backend,
+            device_type = ?adapter_info.device_type,
+            max_batch_size = config.max_batch_size,
+            flow_capacity = config.flow_capacity,
+            listen_port = config.listen_port,
+            "using GPU-native packet engine"
+        );
+
         Ok(Self {
+            _instance: instance,
             device,
             queue,
             pipeline,
