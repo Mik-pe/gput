@@ -250,7 +250,10 @@ fn establish_flows(engine: &impl PacketEngine, flows: &mut [FlowCursor]) -> Resu
         let response = response.context("SYN did not produce SYN-ACK")?;
         validate_ipv4_tcp_checksums(&response)?;
         let tcp = parse_ipv4_tcp(&response).context("SYN-ACK did not parse")?;
-        ensure!(tcp.flags == TCP_SYN | TCP_ACK, "handshake response was not SYN-ACK");
+        ensure!(
+            tcp.flags == TCP_SYN | TCP_ACK,
+            "handshake response was not SYN-ACK"
+        );
         ensure!(
             tcp.ack == flow.client_next.wrapping_add(1),
             "SYN-ACK acknowledged the wrong sequence"
@@ -293,7 +296,10 @@ fn run_http_round(engine: &impl PacketEngine, flows: &mut [FlowCursor]) -> Resul
         let response = response.context("HTTP request produced no packet")?;
         validate_ipv4_tcp_checksums(&response)?;
         let tcp = parse_ipv4_tcp(&response).context("HTTP response did not parse")?;
-        ensure!(tcp.seq == flow.server_next, "HTTP response sequence drifted");
+        ensure!(
+            tcp.seq == flow.server_next,
+            "HTTP response sequence drifted"
+        );
         ensure!(
             tcp.ack == flow.client_next.wrapping_add(DEFAULT_REQUEST.len() as u32),
             "HTTP response acknowledgement drifted"
@@ -370,7 +376,9 @@ fn nanos_to_millis(nanos: u64) -> f64 {
 
 fn print_human(results: &[BenchResult]) {
     println!("gput raw-packet championship");
-    println!("backend     flows     requests   engine req/s   end-to-end req/s   wire pkt/s   MiB/s   p50 round   p99 round   dispatch fill");
+    println!(
+        "backend     flows     requests   engine req/s   end-to-end req/s   wire pkt/s   MiB/s   p50 round   p99 round   dispatch fill"
+    );
     for result in results {
         let fill = result.metrics.packets as f64 / result.metrics.dispatches.max(1) as f64;
         println!(

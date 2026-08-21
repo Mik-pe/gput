@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use gput::packet::{
-    CpuPacketEngine, FlowKey, GpuPacketEngine, PacketEngine, PacketEngineConfig, RawPacket, TCP_ACK,
-    TCP_FIN, TCP_PSH, TCP_SYN, TcpPacketSpec, build_ipv4_tcp_packet, flow_hash,
+    CpuPacketEngine, FlowKey, GpuPacketEngine, PacketEngine, PacketEngineConfig, RawPacket,
+    TCP_ACK, TCP_FIN, TCP_PSH, TCP_SYN, TcpPacketSpec, build_ipv4_tcp_packet, flow_hash,
     parse_ipv4_tcp, validate_ipv4_tcp_checksums,
 };
 
@@ -97,11 +97,7 @@ fn run_protocol_proof(engine: &impl PacketEngine) -> Result<()> {
     Ok(())
 }
 
-fn open_flow(
-    engine: &impl PacketEngine,
-    key: FlowKey,
-    client_isn: u32,
-) -> Result<FlowCursor> {
+fn open_flow(engine: &impl PacketEngine, key: FlowKey, client_isn: u32) -> Result<FlowCursor> {
     let syn = build_ipv4_tcp_packet(TcpPacketSpec {
         key,
         seq: client_isn,
@@ -115,7 +111,10 @@ fn open_flow(
     validate_ipv4_tcp_checksums(&repeated_syn_ack)?;
     let tcp = parse_ipv4_tcp(&syn_ack).context("SYN-ACK did not parse")?;
     let repeated = parse_ipv4_tcp(&repeated_syn_ack).context("repeated SYN-ACK did not parse")?;
-    ensure!(tcp.flags == TCP_SYN | TCP_ACK, "engine did not emit SYN-ACK");
+    ensure!(
+        tcp.flags == TCP_SYN | TCP_ACK,
+        "engine did not emit SYN-ACK"
+    );
     ensure!(
         tcp.ack == client_isn + 1,
         "SYN-ACK acknowledged the wrong client sequence"

@@ -46,7 +46,10 @@ pub fn build_ipv4_tcp_packet(spec: TcpPacketSpec<'_>) -> Result<RawPacket> {
         total_len <= MAX_RAW_PACKET_BYTES,
         "IPv4/TCP packet is {total_len} bytes; maximum is {MAX_RAW_PACKET_BYTES}"
     );
-    ensure!(total_len <= usize::from(u16::MAX), "packet length exceeds IPv4 limit");
+    ensure!(
+        total_len <= usize::from(u16::MAX),
+        "packet length exceeds IPv4 limit"
+    );
 
     let mut packet = vec![0_u8; total_len];
     packet[0] = 0x45;
@@ -76,10 +79,19 @@ pub fn validate_ipv4_tcp_checksums(packet: &RawPacket) -> Result<()> {
     let bytes = packet.as_bytes();
     ensure!(bytes.len() >= 40, "IPv4/TCP packet is too small");
     let header_len = usize::from(bytes[0] & 0x0f) * 4;
-    ensure!(header_len >= 20 && header_len <= bytes.len(), "invalid IPv4 header length");
+    ensure!(
+        header_len >= 20 && header_len <= bytes.len(),
+        "invalid IPv4 header length"
+    );
     let total_len = usize::from(read_u16(bytes, 2));
-    ensure!(total_len <= bytes.len(), "IPv4 total length exceeds packet bytes");
-    ensure!(checksum(&bytes[..header_len]) == 0, "invalid IPv4 header checksum");
+    ensure!(
+        total_len <= bytes.len(),
+        "IPv4 total length exceeds packet bytes"
+    );
+    ensure!(
+        checksum(&bytes[..header_len]) == 0,
+        "invalid IPv4 header checksum"
+    );
     ensure!(
         tcp_checksum(&bytes[..total_len], header_len, false) == 0,
         "invalid TCP checksum"

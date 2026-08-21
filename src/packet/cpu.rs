@@ -6,14 +6,14 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use super::{
     PacketEngine, PacketEngineConfig, PacketEngineMetrics, RawPacket, classify_http_request,
     packet_response, validate_config,
     wire::{
-        FlowKey, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpPacketSpec,
-        build_ipv4_tcp_packet, flow_hash, parse_ipv4_tcp,
+        FlowKey, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpPacketSpec, build_ipv4_tcp_packet,
+        flow_hash, parse_ipv4_tcp,
     },
 };
 
@@ -69,7 +69,10 @@ impl PacketEngine for CpuPacketEngine {
         self.dispatches.fetch_add(1, Ordering::Relaxed);
         self.packets
             .fetch_add(packets.len() as u64, Ordering::Relaxed);
-        let mut flows = self.flows.lock().context("CPU packet flow table poisoned")?;
+        let mut flows = self
+            .flows
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CPU packet flow table poisoned"))?;
         packets
             .iter()
             .map(|packet| process_packet(&mut flows, self.config, packet))
@@ -137,17 +140,14 @@ fn process_packet(
         return Ok(None);
     };
     if flow.state == FlowState::SynReceived {
-        if tcp.flags & TCP_ACK == 0
-            || tcp.ack != flow.send_next
-            || tcp.seq != flow.recv_next
-        {
+        if tcp.flags & TCP_ACK == 0 || tcp.ack != flow.send_next || tcp.seq != flow.recv_next {
             return Ok(None);
         }
         flow.state = FlowState::Established;
         flow.send_unacked = tcp.ack;
     }
 
-    if tcp.flags & TCP_ACK != 0 && tcp.ack == flow.send_next {
+    if tcp.flags & TCP_ACK != 0 && tcp.ack == flow.send_next && tcp.ack != flow.send_unacked {
         flow.send_unacked = tcp.ack;
     }
 
@@ -221,13 +221,7 @@ fn cpu_response(response_id: u32) -> Vec<u8> {
     response
 }
 
-fn emit(
-    key: FlowKey,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    payload: &[u8],
-) -> Result<RawPacket> {
+fn emit(key: FlowKey, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> Result<RawPacket> {
     build_ipv4_tcp_packet(TcpPacketSpec {
         key: FlowKey {
             src_ip: key.dst_ip,

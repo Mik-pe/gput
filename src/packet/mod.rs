@@ -233,7 +233,8 @@ impl GpuPacketEngine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&flow_state, 0, bytemuck::cast_slice(&vec![0_u32; flow_words]));
+        let empty_flow_state = vec![0_u32; flow_words];
+        queue.write_buffer(&flow_state, 0, bytemuck::cast_slice(&empty_flow_state));
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("packet engine bind group layout"),
@@ -341,10 +342,8 @@ impl GpuPacketEngine {
         self.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
 
-        let meta_copy_bytes =
-            (packet_count * std::mem::size_of::<PacketMeta>()) as u64;
-        let word_copy_bytes =
-            (packet_count * PACKET_WORDS * std::mem::size_of::<u32>()) as u64;
+        let meta_copy_bytes = (packet_count * std::mem::size_of::<PacketMeta>()) as u64;
+        let word_copy_bytes = (packet_count * PACKET_WORDS * std::mem::size_of::<u32>()) as u64;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -421,7 +420,10 @@ impl PacketEngine for GpuPacketEngine {
         let waves = schedule_waves(packets, self.config.max_batch_size);
         let mut output = vec![None; packets.len()];
         for wave in waves {
-            let inputs = wave.iter().map(|index| &packets[*index]).collect::<Vec<_>>();
+            let inputs = wave
+                .iter()
+                .map(|index| &packets[*index])
+                .collect::<Vec<_>>();
             let wave_output = self.dispatch_wave(&inputs)?;
             for (index, packet) in wave.into_iter().zip(wave_output) {
                 output[index] = packet;
@@ -445,7 +447,10 @@ pub(crate) fn validate_config(config: PacketEngineConfig) -> Result<()> {
         config.flow_capacity.is_power_of_two(),
         "flow capacity must be a power of two"
     );
-    ensure!(config.flow_probe_limit > 0, "flow probe limit must be positive");
+    ensure!(
+        config.flow_probe_limit > 0,
+        "flow probe limit must be positive"
+    );
     ensure!(
         config.flow_probe_limit <= config.flow_capacity,
         "flow probe limit must not exceed flow capacity"
@@ -494,10 +499,7 @@ pub(crate) fn classify_http_request(payload: &[u8]) -> u32 {
     if method != b"GET" {
         return RESPONSE_METHOD_NOT_ALLOWED;
     }
-    let path = target
-        .split(|byte| *byte == b'?')
-        .next()
-        .unwrap_or(target);
+    let path = target.split(|byte| *byte == b'?').next().unwrap_or(target);
     match path {
         b"/plaintext" => RESPONSE_PLAINTEXT,
         b"/health" => RESPONSE_HEALTH,
@@ -560,13 +562,19 @@ fn packet_shader_source() -> Result<String> {
         "const RESPONSE_COUNT: u32 = {}u;",
         PACKET_RESPONSES.len()
     )?;
-    writeln!(source, "const RESPONSE_PLAINTEXT: u32 = {RESPONSE_PLAINTEXT}u;")?;
+    writeln!(
+        source,
+        "const RESPONSE_PLAINTEXT: u32 = {RESPONSE_PLAINTEXT}u;"
+    )?;
     writeln!(source, "const RESPONSE_HEALTH: u32 = {RESPONSE_HEALTH}u;")?;
     writeln!(
         source,
         "const RESPONSE_BAD_REQUEST: u32 = {RESPONSE_BAD_REQUEST}u;"
     )?;
-    writeln!(source, "const RESPONSE_NOT_FOUND: u32 = {RESPONSE_NOT_FOUND}u;")?;
+    writeln!(
+        source,
+        "const RESPONSE_NOT_FOUND: u32 = {RESPONSE_NOT_FOUND}u;"
+    )?;
     writeln!(
         source,
         "const RESPONSE_METHOD_NOT_ALLOWED: u32 = {RESPONSE_METHOD_NOT_ALLOWED}u;"
@@ -644,11 +652,7 @@ fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_>
     }
 }
 
-fn map_read(
-    device: &wgpu::Device,
-    buffer: &wgpu::Buffer,
-    size: u64,
-) -> Result<wgpu::BufferView> {
+fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer, size: u64) -> Result<wgpu::BufferView> {
     let slice = buffer.slice(0..size);
     let (sender, receiver) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -735,10 +739,7 @@ mod tests {
             src_port: 3,
             dst_port: 4,
         };
-        let other = FlowKey {
-            src_port: 5,
-            ..key
-        };
+        let other = FlowKey { src_port: 5, ..key };
         let packets = [key, key, other]
             .map(|key| {
                 build_ipv4_tcp_packet(TcpPacketSpec {
@@ -757,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn CPU_request_classifier_matches_packet_routes() {
+    fn cpu_request_classifier_matches_packet_routes() {
         assert_eq!(
             classify_http_request(b"GET /plaintext?owl=yes HTTP/1.1\r\n\r\n"),
             RESPONSE_PLAINTEXT

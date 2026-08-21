@@ -89,7 +89,9 @@ fn main() -> Result<()> {
 
     loop {
         batch.clear();
-        let first_len = device.recv(&mut buffer).context("failed to read TUN packet")?;
+        let first_len = device
+            .recv(&mut buffer)
+            .context("failed to read TUN packet")?;
         if first_len == 0 {
             continue;
         }
