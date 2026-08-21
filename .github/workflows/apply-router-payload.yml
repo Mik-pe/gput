@@ -50,7 +50,7 @@ jobs:
           test -f src/processor/http.wgsl
           test -f tests/router_api.rs
 
-      - name: Apply status-line fix found during preflight review
+      - name: Apply review fixes found during preflight
         shell: bash
         run: |
           set -euo pipefail
@@ -72,6 +72,14 @@ jobs:
           if before not in source:
               raise SystemExit("expected router header-size block was not found")
           router.write_text(source.replace(before, after, 1))
+
+          config = Path("src/config.rs")
+          source = config.read_text()
+          before = """    fn rejects_response_slots_below_the_absolute_minimum() {\n        let mut config = ServerConfig::default();\n        config.response_slot_bytes = MIN_GPU_RESPONSE_SLOT_BYTES - 1;\n\n        assert!(config.validate().is_err());\n    }\n"""
+          after = """    fn rejects_response_slots_below_the_absolute_minimum() {\n        let config = ServerConfig {\n            response_slot_bytes: MIN_GPU_RESPONSE_SLOT_BYTES - 1,\n            ..ServerConfig::default()\n        };\n\n        assert!(config.validate().is_err());\n    }\n"""
+          if before not in source:
+              raise SystemExit("expected response-slot test block was not found")
+          config.write_text(source.replace(before, after, 1))
           PY
 
       - name: Install Rust 1.97.1
