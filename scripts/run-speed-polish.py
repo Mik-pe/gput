@@ -30,4 +30,8 @@ def replace(source: str, old: str, new: str, label: str) -> str:
 if old not in source:
     raise SystemExit("speed-polish replace helper did not match")
 source = source.replace(old, new, 1)
+ci_marker = '\nci_path = ".github/workflows/ci.yml"\n'
+if ci_marker not in source:
+    raise SystemExit("speed-polish CI tail marker did not match")
+source = source.split(ci_marker, 1)[0] + "\n"
 exec(compile(source, str(path), "exec"))
