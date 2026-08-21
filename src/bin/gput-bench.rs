@@ -121,18 +121,12 @@ impl TryFrom<Cli> for BenchConfig {
 
     fn try_from(cli: Cli) -> Result<Self> {
         ensure!(cli.requests > 0, "--requests must be greater than zero");
-        ensure!(
-            cli.concurrency > 0,
-            "--concurrency must be greater than zero"
-        );
+        ensure!(cli.concurrency > 0, "--concurrency must be greater than zero");
         ensure!(cli.pipeline > 0, "--pipeline must be greater than zero");
         ensure!(cli.repeats > 0, "--repeats must be greater than zero");
         ensure!(
             !cli.suite_concurrency.is_empty()
-                && cli
-                    .suite_concurrency
-                    .iter()
-                    .all(|concurrency| *concurrency > 0),
+                && cli.suite_concurrency.iter().all(|concurrency| *concurrency > 0),
             "--suite-concurrency must contain positive values"
         );
         ensure!(
@@ -251,10 +245,14 @@ impl BenchConnection {
         let mut chunk = [0_u8; 8 * 1024];
 
         loop {
-            if let Some(response_len) =
-                response_frame_len(&self.read_buffer, target.max_response_bytes)?
-            {
-                validate_response(&self.read_buffer[..response_len], target.expected_backend)?;
+            if let Some(response_len) = response_frame_len(
+                &self.read_buffer,
+                target.max_response_bytes,
+            )? {
+                validate_response(
+                    &self.read_buffer[..response_len],
+                    target.expected_backend,
+                )?;
                 let remaining = self.read_buffer.len() - response_len;
                 self.read_buffer.copy_within(response_len.., 0);
                 self.read_buffer.truncate(remaining);
@@ -394,11 +392,12 @@ async fn run_phase(
                 }
                 let count = usize::try_from((requests - first_request).min(claim))
                     .context("pipeline batch size does not fit usize")?;
-                let batch = time::timeout(target.timeout, connection.round_trip(&target, count))
-                    .await
-                    .with_context(|| {
-                        format!("request batch starting at {first_request} timed out")
-                    })??;
+                let batch = time::timeout(
+                    target.timeout,
+                    connection.round_trip(&target, count),
+                )
+                .await
+                .with_context(|| format!("request batch starting at {first_request} timed out"))??;
 
                 result.response_bytes = result
                     .response_bytes
@@ -564,7 +563,7 @@ fn percentile_nearest_rank(sorted_nanos: &[u64], percentile: u32) -> u64 {
 
 fn median_f64(sorted: &[f64]) -> f64 {
     let middle = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
+    if sorted.len() % 2 == 0 {
         (sorted[middle - 1] + sorted[middle]) / 2.0
     } else {
         sorted[middle]
@@ -573,7 +572,7 @@ fn median_f64(sorted: &[f64]) -> f64 {
 
 fn median_u64(sorted: &[u64]) -> u64 {
     let middle = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
+    if sorted.len() % 2 == 0 {
         sorted[middle - 1].saturating_add(sorted[middle]) / 2
     } else {
         sorted[middle]

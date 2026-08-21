@@ -260,10 +260,7 @@ mod tests {
         let (mut writer, mut reader) = duplex(wire.len());
         let mut pending = Vec::new();
 
-        writer
-            .write_all(&wire)
-            .await
-            .expect("write pipelined requests");
+        writer.write_all(&wire).await.expect("write pipelined requests");
         drop(writer);
 
         let first_read = read_raw_request(&mut reader, &mut pending, 4_096)

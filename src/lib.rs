@@ -3,6 +3,7 @@
 pub mod batcher;
 pub mod config;
 pub mod network;
+pub mod packet;
 pub mod processor;
 pub mod protocol;
 pub mod router;
