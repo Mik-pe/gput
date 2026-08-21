@@ -4,7 +4,7 @@
 
 **GPU throughput applied to the least deserving workload imaginable.**
 
-`gput` is an experimental HTTP/1.1 server written in Rust. The CPU accepts and frames TCP traffic; a GPU compute shader parses request lines, selects application routes, executes tiny response programs, and writes complete HTTP responses into storage buffers.
+`gput` is an experimental HTTP/1.1 server written in Rust. The normal mode lets the CPU accept and frame TCP traffic while a GPU compute shader parses request lines, selects application routes, executes tiny response programs, and writes complete HTTP responses into storage buffers. The more unreasonable mode also contains an experimental GPU-owned IPv4/TCP fast path fed by raw packets.
 
 The name is the union of **GPU** and **throughput**, with enough resemblance to an unfortunate Unix command to be trustworthy.
 
@@ -77,6 +77,8 @@ Responses support text, JSON, HTML, custom content types, and custom status code
 
 ## Data path
 
+The normal portable server path is:
+
 ```text
 persistent TCP connection
     |
@@ -99,6 +101,47 @@ persistent TCP connection
 
 HTTP/1.1 connections stay open by default. Multiple complete requests already waiting on a socket are preserved rather than discarded, so ordinary keep-alive and HTTP/1.1 pipelining work. HTTP/1.0 and explicit `Connection: close` requests close after their response.
 
+## GPU-native TCP path
+
+`GpuPacketEngine` moves the experiment one layer lower. Its portability boundary is deliberately tiny:
+
+```text
+raw IPv4 packets
+    |
+    v
+GPU compute
+    |  IPv4 parsing
+    |  TCP flow lookup + persistent state
+    |  SYN / SYN-ACK / ACK
+    |  in-order sequence validation
+    |  GET /plaintext
+    |  HTTP response
+    |  IPv4 + TCP checksums
+    |  FIN acknowledgement
+    v
+raw IPv4 packets
+```
+
+`gput-packetd` connects that engine to a cross-platform L3 TUN interface. On Linux the CI suite proves a real `curl` can establish TCP with the GPU state machine and receive `Hello, World!` without terminating in a normal server TCP socket.
+
+```bash
+cargo build --release --locked --bin gput-packetd
+sudo ./target/release/gput-packetd \
+  --local 10.77.0.1 \
+  --peer 10.77.0.2 \
+  --listen-port 8080
+```
+
+Then from another terminal:
+
+```bash
+curl --noproxy '*' http://10.77.0.2:8080/plaintext
+```
+
+The same WGSL protocol engine can run through Metal on Apple Silicon and Vulkan on AMD, NVIDIA, or Intel. TUN is currently the portable packet transport. The AMD direct target is a ROCm XIO/HIP transport that replaces the TUN source/sink while preserving the same TCP semantics.
+
+See [docs/GPU_NETWORKING.md](docs/GPU_NETWORKING.md) for the packet architecture, macOS path, AMD direct path, and TCP hardening roadmap.
+
 ## What works
 
 - Tokio TCP listener
@@ -116,6 +159,10 @@ HTTP/1.1 connections stay open by default. Multiple complete requests already wa
 - automatic CPU fallback
 - limits for request size, response size, connection count, queue depth, and slow clients
 - a persistent concurrent benchmark client with backend verification, percentiles, pipelining, concurrency sweeps, repeated runs, medians, and JSON output
+- a vendor-neutral raw IPv4/TCP compute engine with persistent GPU flow state
+- a Linux/macOS-capable TUN bridge into that packet engine
+- GPU-generated IPv4 and TCP checksums
+- synthetic GPU TCP handshake validation and real Linux TUN-to-GPU `curl` coverage in CI
 - CPU socket smoke and Vulkan/Lavapipe GPU smoke
 
 The `gput` binary exposes:
@@ -219,11 +266,12 @@ This is dynamic composition, not a general-purpose GPU heap. The router and stri
 cargo build --locked --bins
 bash scripts/smoke.sh cpu target/debug/gput
 bash scripts/smoke.sh gpu target/debug/gput
+cargo run --release --locked --bin gput-packet-demo
 ```
 
-The GPU smoke forces `wgpu` through Vulkan and Mesa Lavapipe. That exercises real upload, dispatch, shader parsing/routing, response interpretation, UTF-8 writing, readback, and socket response plumbing. Lavapipe proves correctness, not discrete-GPU performance.
+CI goes further than the synthetic packet demo. It creates a real Linux TUN interface, starts `gput-packetd` against Vulkan/Lavapipe, and curls the virtual peer through the GPU-owned TCP path. Lavapipe proves correctness, not discrete-GPU performance.
 
-CI runs formatting, Clippy with warnings denied, tests, both binaries, and CPU/GPU socket smoke. A red direct-to-main build opens a failure-log issue; the next green build closes superseded failure issues.
+A red direct-to-main build opens a failure-log issue; the next green build closes superseded failure issues automatically.
 
 ## Development rule
 
@@ -231,6 +279,6 @@ Work goes directly into `main`. No mandatory branches, no default pull requests,
 
 ## Honest limitations
 
-This is not a production web server. It currently has no TLS, request bodies, HTTP/2, HTTP/3, path parameters, middleware, arbitrary application headers, mutable GPU string heap, persistent mapped ring buffers, or zero-copy NIC integration. Routes are exact static paths and response programs are intentionally small and bounded.
+This is not a production web server. The socket path has no TLS, request bodies, HTTP/2, HTTP/3, path parameters, arbitrary middleware, mutable GPU string heap, persistent mapped packet rings, or zero-copy NIC integration. The raw-packet TCP path deliberately lacks retransmission, congestion control, receive-window management, out-of-order reassembly, SYN-flood protection, IPv6, fragmentation handling, and collision-safe flow-table probing.
 
-The next useful expansion is typed GPU-native work such as hashing, image processing, vector search, or inference without exposing raw WGSL to application authors. Until then, this is a surprisingly ergonomic electrical joke.
+The portable TUN bridge currently handles one packet per GPU dispatch, so it exists to prove the architecture, not to claim peak packet throughput. The next performance work is batching/ring buffers, then AF_XDP and AMD ROCm XIO/direct NIC transport. The project has officially escaped the HTTP layer and started chewing on the network stack itself.
