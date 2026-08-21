@@ -1,0 +1,23 @@
+name: trigger speed surgery
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/speed-polish-trigger.yml
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch the measured optimization
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/speed-polish-v3.yml/dispatches" \
+            -f ref=main
