@@ -38,24 +38,38 @@ exec(compile(source, str(path), "exec"))
 
 batcher = Path("src/batcher.rs")
 batcher_source = batcher.read_text()
-old_order = """        jobs.clear();
+request_declaration = "    let mut requests = Vec::with_capacity(config.max_batch_size);\n"
+if request_declaration not in batcher_source:
+    raise SystemExit("reusable request-reference vector declaration did not match")
+batcher_source = batcher_source.replace(request_declaration, "", 1)
+reset_block = """        jobs.clear();
         requests.clear();
         jobs.push(first);
 """
-new_order = """        requests.clear();
-        jobs.clear();
+if reset_block not in batcher_source:
+    raise SystemExit("batcher reset block did not match")
+batcher_source = batcher_source.replace(
+    reset_block,
+    """        jobs.clear();
         jobs.push(first);
-"""
-if old_order not in batcher_source:
-    raise SystemExit("batcher reset order did not match")
-batcher_source = batcher_source.replace(old_order, new_order, 1)
-old_call = """        requests.extend(jobs.iter().map(|job| job.request.as_slice()));
+""",
+    1,
+)
+call_block = """        requests.extend(jobs.iter().map(|job| job.request.as_slice()));
         let result = processor.process_batch(&requests);
 """
-new_call = """        requests.extend(jobs.iter().map(|job| job.request.as_slice()));
-        let result = processor.process_batch(&requests);
-        requests.clear();
-"""
-if old_call not in batcher_source:
+if call_block not in batcher_source:
     raise SystemExit("batcher processor call did not match")
-batcher.write_text(batcher_source.replace(old_call, new_call, 1))
+batcher_source = batcher_source.replace(
+    call_block,
+    """        let result = {
+            let requests = jobs
+                .iter()
+                .map(|job| job.request.as_slice())
+                .collect::<Vec<_>>();
+            processor.process_batch(&requests)
+        };
+""",
+    1,
+)
+batcher.write_text(batcher_source)
