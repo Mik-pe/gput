@@ -279,7 +279,6 @@ source = replace_once(
 """,
     "combined packet readback",
 )
-source = source.replace("        Ok(output)\n    }\n}\n\nimpl PacketEngine", "        Ok(output)\n    }\n}\n\nimpl PacketEngine", 1)
 source = replace_once(
     source,
     """    let largest_response = PACKET_RESPONSES
@@ -366,7 +365,7 @@ source = replace_once(
         assert!(response_bytes < MAX_RAW_PACKET_BYTES / 2);
         assert_eq!(
             response_bytes.div_ceil(std::mem::size_of::<u32>()),
-            58
+            56
         );
     }
 """,
