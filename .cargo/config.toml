@@ -1,0 +1,8 @@
+[alias]
+serve = "run --release --locked --bin gput --"
+doctor = "run --release --locked --bin gput-doctor --"
+hello-gpu = "run --release --locked --example hello_gpu --"
+packetd = "run --release --locked --bin gput-packetd --"
+prove-gpu = "run --release --locked --bin gput-packet-demo --"
+packet-bench = "run --release --locked --bin gput-packet-bench --"
+http-bench = "run --release --locked --bin gput-bench --"

@@ -5,16 +5,31 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use clap::Parser;
-use gput::packet::{GpuPacketEngine, PacketEngine, PacketEngineConfig, RawPacket};
+use clap::{Parser, ValueEnum};
+use gput::packet::{
+    CpuPacketEngine, GpuPacketEngine, PacketEngine, PacketEngineConfig, RawPacket,
+};
+use tracing_subscriber::EnvFilter;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum PacketBackendChoice {
+    #[default]
+    Auto,
+    Cpu,
+    Gpu,
+}
 
 #[derive(Debug, Parser)]
 #[command(
     name = "gput-packetd",
     version,
-    about = "Serve the GPU TCP fast path through a batched portable L3 TUN interface"
+    about = "Serve gput's tiny TCP fast path through a batched portable L3 TUN interface",
+    after_help = "The selected engine always identifies itself in X-Gput-Backend. No fake GPU moustaches."
 )]
 struct Cli {
+    #[arg(long, value_enum, default_value_t = PacketBackendChoice::Auto)]
+    backend: PacketBackendChoice,
+
     #[arg(long, default_value = "10.77.0.1")]
     local: Ipv4Addr,
 
@@ -30,8 +45,13 @@ struct Cli {
     #[arg(long, default_value_t = 8080)]
     listen_port: u16,
 
-    #[arg(long, default_value_t = 256)]
-    gpu_batch_capacity: usize,
+    #[arg(
+        long,
+        visible_alias = "gpu-batch-capacity",
+        default_value_t = 256,
+        help = "Maximum independent packets offered to one engine call"
+    )]
+    batch_capacity: usize,
 
     #[arg(long, default_value_t = 50)]
     batch_wait_micros: u64,
@@ -46,14 +66,35 @@ struct Cli {
     stats_interval_secs: u64,
 }
 
+struct SelectedEngine {
+    engine: Box<dyn PacketEngine>,
+    adapter: Option<String>,
+    fallback_reason: Option<String>,
+}
+
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("gput=info")),
+        )
+        .with_target(false)
+        .compact()
+        .init();
+
     let cli = Cli::parse();
-    let engine = GpuPacketEngine::new(PacketEngineConfig {
-        max_batch_size: cli.gpu_batch_capacity,
+    let config = PacketEngineConfig {
+        max_batch_size: cli.batch_capacity,
         flow_capacity: cli.flow_capacity,
         flow_probe_limit: cli.flow_probe_limit,
         listen_port: cli.listen_port,
-    })?;
+    };
+    let selected = select_engine(cli.backend, config)?;
+    let engine_name = selected.engine.name();
+
+    if let Some(reason) = &selected.fallback_reason {
+        eprintln!("GPU declined the invitation: {reason:#}");
+        eprintln!("Falling back to the CPU reference without pretending otherwise.");
+    }
 
     let mut tun_config = tun::Configuration::default();
     tun_config
@@ -69,15 +110,21 @@ fn main() -> Result<()> {
     });
 
     let device = tun::create(&tun_config).context("failed to create TUN interface")?;
+    eprintln!("gput-packetd");
+    eprintln!("  engine:  {engine_name}");
     eprintln!(
-        "gput GPU packet path ready on {}: curl --noproxy '*' http://{}:{}/plaintext",
-        engine.adapter_name(),
-        cli.peer,
-        cli.listen_port
+        "  adapter: {}",
+        selected.adapter.as_deref().unwrap_or("host CPU")
     );
+    eprintln!("  routes:  GET /plaintext, GET /health");
+    eprintln!(
+        "  try:     curl --noproxy '*' http://{}:{}/plaintext",
+        cli.peer, cli.listen_port
+    );
+    eprintln!("  recipe:  raw packets, bounded buffers, and unreasonable stubbornness");
 
     let mut buffer = vec![0_u8; usize::from(cli.mtu).max(2048)];
-    let mut batch = Vec::with_capacity(cli.gpu_batch_capacity);
+    let mut batch = Vec::with_capacity(cli.batch_capacity);
     let batch_wait = Duration::from_micros(cli.batch_wait_micros);
     let stats_interval = Duration::from_secs(cli.stats_interval_secs);
     let started = Instant::now();
@@ -98,7 +145,7 @@ fn main() -> Result<()> {
         batch.push(RawPacket::new(buffer[..first_len].to_vec())?);
 
         let deadline = Instant::now() + batch_wait;
-        while batch.len() < cli.gpu_batch_capacity {
+        while batch.len() < cli.batch_capacity {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -120,10 +167,10 @@ fn main() -> Result<()> {
         packets_in = packets_in.saturating_add(batch.len() as u64);
         batches = batches.saturating_add(1);
         peak_batch = peak_batch.max(batch.len());
-        for response in engine.process_batch(&batch)?.into_iter().flatten() {
+        for response in selected.engine.process_batch(&batch)?.into_iter().flatten() {
             let sent = device
                 .send(response.as_bytes())
-                .context("failed to inject GPU response into TUN")?;
+                .context("failed to inject engine response into TUN")?;
             ensure!(
                 sent == response.as_bytes().len(),
                 "TUN accepted {sent} of {} response bytes",
@@ -134,15 +181,79 @@ fn main() -> Result<()> {
 
         if !stats_interval.is_zero() && last_stats.elapsed() >= stats_interval {
             let elapsed = started.elapsed().as_secs_f64();
-            let metrics = engine.metrics();
+            let metrics = selected.engine.metrics();
             let average_batch = packets_in as f64 / batches.max(1) as f64;
             let packets_per_dispatch = metrics.packets as f64 / metrics.dispatches.max(1) as f64;
             eprintln!(
-                "gput packet stats: in={packets_in} out={packets_out} pps={:.0} batches={batches} avg_batch={average_batch:.2} peak_batch={peak_batch} gpu_dispatches={} packets/dispatch={packets_per_dispatch:.2}",
+                "gput packet stats: engine={engine_name} in={packets_in} out={packets_out} pps={:.0} batches={batches} avg_batch={average_batch:.2} peak_batch={peak_batch} engine_dispatches={} packets/dispatch={packets_per_dispatch:.2}",
                 packets_in as f64 / elapsed.max(f64::EPSILON),
                 metrics.dispatches,
             );
             last_stats = Instant::now();
         }
+    }
+}
+
+fn select_engine(
+    choice: PacketBackendChoice,
+    config: PacketEngineConfig,
+) -> Result<SelectedEngine> {
+    match choice {
+        PacketBackendChoice::Cpu => {
+            let engine = CpuPacketEngine::new(config)?;
+            Ok(SelectedEngine {
+                engine: Box::new(engine),
+                adapter: None,
+                fallback_reason: None,
+            })
+        }
+        PacketBackendChoice::Gpu => select_gpu(config, None),
+        PacketBackendChoice::Auto => match GpuPacketEngine::new(config) {
+            Ok(engine) => Ok(SelectedEngine {
+                adapter: Some(engine.adapter_name().to_owned()),
+                engine: Box::new(engine),
+                fallback_reason: None,
+            }),
+            Err(error) => {
+                let engine = CpuPacketEngine::new(config)?;
+                Ok(SelectedEngine {
+                    engine: Box::new(engine),
+                    adapter: None,
+                    fallback_reason: Some(format!("{error:#}")),
+                })
+            }
+        },
+    }
+}
+
+fn select_gpu(config: PacketEngineConfig, fallback_reason: Option<String>) -> Result<SelectedEngine> {
+    let engine = GpuPacketEngine::new(config)?;
+    Ok(SelectedEngine {
+        adapter: Some(engine.adapter_name().to_owned()),
+        engine: Box::new(engine),
+        fallback_reason,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_cpu_mode_never_grows_a_fake_gpu_moustache() {
+        let selected = select_engine(
+            PacketBackendChoice::Cpu,
+            PacketEngineConfig {
+                max_batch_size: 4,
+                flow_capacity: 64,
+                flow_probe_limit: 16,
+                listen_port: 8080,
+            },
+        )
+        .expect("CPU packet engine initializes");
+
+        assert_eq!(selected.engine.name(), "cpu-packet");
+        assert!(selected.adapter.is_none());
+        assert!(selected.fallback_reason.is_none());
     }
 }

@@ -1,15 +1,54 @@
 # gput
 
 [![ci](https://github.com/Mik-pe/gput/actions/workflows/ci.yml/badge.svg)](https://github.com/Mik-pe/gput/actions/workflows/ci.yml)
+[![packet proof](https://github.com/Mik-pe/gput/actions/workflows/packet-proof.yml/badge.svg)](https://github.com/Mik-pe/gput/actions/workflows/packet-proof.yml)
 [![macOS](https://github.com/Mik-pe/gput/actions/workflows/macos.yml/badge.svg)](https://github.com/Mik-pe/gput/actions/workflows/macos.yml)
 
-**GPU throughput applied to the least deserving workload imaginable.**
+> HTTP, TCP, UTF-8, and other things WGSL was never emotionally prepared for.
 
-`gput` is an experimental HTTP/1.1 server written in Rust. Its portable socket mode lets the CPU own TCP framing while a GPU compute shader parses request lines, routes requests, executes bounded response programs and writes complete HTTP responses. Its more unreasonable packet mode also owns a useful slice of IPv4/TCP state in compute and can serve a real client through raw packets instead of a server socket.
+`gput` is an experimental Rust web framework and tiny TCP fast path built from GPU compute shaders, bounded buffers, bit shifts, atomics, and a frankly unreasonable amount of stubbornness.
 
-The name is the union of **GPU** and **throughput**, with enough resemblance to an unfortunate Unix command to be trustworthy.
+The CPU may still open doors, move packet batches, and make coffee. On the honest GPU paths, request parsing, routing, response construction, TCP flow state, and packet checksums happen in actual compute dispatches. No CUDA is required. No fake GPU moustache is permitted.
 
-## Write a GPU web app without writing WGSL
+The project is a joke. The measurements are not.
+
+## Five-minute bad decision
+
+The repository ships local Cargo aliases, so the first encounter no longer requires memorising the names of six binaries.
+
+```bash
+cargo doctor
+```
+
+`cargo doctor` finds the selected adapter, executes a real GPU HTTP request, performs a raw SYN/ACK/HTTP exchange through the packet shader, validates the checksums, and tells you whether the adapter is hardware or software. Lavapipe is useful proof, but it does not receive a tiny benchmark trophy.
+
+Run the ordinary socket server:
+
+```bash
+cargo serve --backend gpu
+curl -i http://127.0.0.1:8080/plaintext
+```
+
+Run a small custom application:
+
+```bash
+cargo hello-gpu
+curl -i 'http://127.0.0.1:8080/inspect?owl=yes'
+```
+
+Prove the raw packet state machine without creating a TUN interface:
+
+```bash
+cargo prove-gpu
+```
+
+Compare identical raw IPv4/TCP conversations on the CPU reference and GPU engine:
+
+```bash
+cargo packet-bench --backend both --flows 4096 --requests-per-flow 1000
+```
+
+## Write normal-looking server code, produce abnormal machinery
 
 ```rust
 use anyhow::Result;
@@ -29,15 +68,13 @@ async fn main() -> Result<()> {
             get(Response::text(
                 Body::new()
                     .push("path=")
-                    .path(64)
+                    .path(128)
                     .push("\nquery=")
-                    .query(64)
-                    .push("\nrequest_bytes=")
-                    .request_bytes()
-                    .push("\npath_hash=")
-                    .path_hash()
+                    .query(128)
                     .push("\nbackend=")
                     .backend()
+                    .push("\npath_hash=")
+                    .path_hash()
                     .push("\n"),
             )),
         );
@@ -46,82 +83,66 @@ async fn main() -> Result<()> {
 }
 ```
 
-This is Axum-inspired, not Axum-compatible. The builders run once at startup and compile the application into immutable GPU data:
+This API is Axum-inspired, not Axum-compatible. Builders execute once at startup and compile the application into:
 
 ```text
-Rust Router
-    |
-    +--> exact-path route table
-    +--> response descriptors
-    +--> bounded body bytecode
-    +--> UTF-8 string arena
-    |
-    v
-GPU storage buffers
+exact-path route table
+response descriptors
+bounded body bytecode
+UTF-8 string arena
 ```
 
-For every GPU request the shader still performs request-line parsing, route selection, exact collision-safe path comparison, response-program execution, header assembly, UTF-8 output and `Content-Length` formatting. The CPU implementation consumes the same compiled router as a baseline and fallback.
+The compute shader parses `GET /path?query HTTP/1.1`, performs collision-safe route lookup, interprets the response program, formats decimal lengths, and writes the complete HTTP response.
 
-## Two data paths
+WGSL has no string type, so gput manufactures one from storage buffers, scalar validation, shifts, masks, and professional-grade stubbornness. It is not elegant in the conventional sense. It is, however, bounds checked.
 
-### Portable socket path
+See [`examples/hello_gpu.rs`](examples/hello_gpu.rs) for the complete tiny application.
+
+## Choose your preferred level of poor judgement
+
+### 1. GPU application logic behind normal TCP
 
 ```text
-persistent TCP connection
-    |
-    | CPU frames complete HTTP requests
-    v
-bounded request batches
-    |
-    v
-wgpu compute dispatch
-    |  parse GET /path?query HTTP/1.1
-    |  route
-    |  execute response bytecode
-    |  build HTTP response
-    v
-GPU readback
-    |
-    v
-persistent TCP connection
+Linux/macOS TCP
+      |
+CPU frames complete requests
+      |
+GPU parses, routes, and builds HTTP
+      |
+CPU writes returned bytes
 ```
 
-HTTP/1.1 connections stay open by default. Multiple requests already waiting on a socket are preserved, so keep-alive and basic HTTP/1.1 pipelining work.
-
-### GPU-owned packet path
-
-```text
-TUN / future NIC packet ring
-    |
-    v
-raw IPv4 packet batches
-    |
-    v
-GPU compute
-    |  IPv4 and TCP parsing
-    |  collision-safe flow lookup
-    |  SYN / SYN-ACK / ACK
-    |  sequence and acknowledgement state
-    |  retransmitted SYN/data recovery
-    |  HTTP request-line routing
-    |  200 / 400 / 404 / 405 responses
-    |  IPv4 and TCP checksums
-    |  FIN / RST cleanup
-    v
-raw IPv4 response batches
-```
-
-`GpuPacketEngine` stores the complete IPv4 four-tuple and sequence state in GPU-visible storage. A hash only chooses the first slot; bounded open addressing and exact tuple comparison keep colliding connections separate. Independent flows run in parallel, while packets belonging to one flow are scheduled into ordered dispatch waves.
-
-`gput-packetd` connects that engine to a cross-platform L3 TUN interface and gathers packets into configurable GPU batches. On Linux, CI proves that a real `curl` can establish TCP with this state machine and receive `Hello, World!` without terminating in a normal server TCP socket.
+This is the portable everyday mode. It supports persistent HTTP/1.1 connections, basic pipelining, exact static routes, dynamic bounded response segments, JSON/HTML/text responses, a CPU baseline, and automatic fallback.
 
 ```bash
-cargo build --release --locked --bin gput-packetd
-sudo ./target/release/gput-packetd \
+cargo serve --backend auto
+```
+
+### 2. GPU-owned TCP through TUN
+
+```text
+curl
+  |
+kernel route
+  |
+TUN raw IPv4 packets
+  |
+GPU TCP state machine and HTTP router
+  |
+checksummed IPv4/TCP response packets
+  |
+TUN
+```
+
+Start the packet daemon:
+
+```bash
+sudo cargo packetd \
+  --backend gpu \
   --local 10.77.0.1 \
   --peer 10.77.0.2 \
   --listen-port 8080 \
-  --gpu-batch-capacity 256 \
+  --batch-capacity 256 \
   --batch-wait-micros 50
 ```
 
@@ -132,29 +153,53 @@ curl --noproxy '*' -i http://10.77.0.2:8080/plaintext
 curl --noproxy '*' -i http://10.77.0.2:8080/health
 ```
 
-The response identifies itself as `X-Gput-Backend: gpu-packet`.
+The packet daemon also accepts `--backend cpu` and `--backend auto`. Auto tries the GPU, falls back to the CPU reference when necessary, prints the reason, and keeps the response header honest:
 
-## Prove it instead of believing it
+```text
+X-Gput-Backend: gpu-packet
+```
 
-One command builds the project, runs the packet-level correctness gauntlet, then feeds the same synthetic IPv4/TCP conversations to a single-threaded CPU reference and the GPU engine:
+or:
+
+```text
+X-Gput-Backend: cpu-packet
+```
+
+That makes the same TUN application useful on machines without a working compute adapter, and makes CPU/GPU comparison less dependent on two unrelated programs.
+
+### 3. Future NIC-to-GPU lunacy
+
+The packet engine is deliberately separated from packet transport:
+
+```text
+RawPacket batch -> PacketEngine -> RawPacket batch
+```
+
+Today the source is TUN. Nearer-term Linux work can use AF_XDP. The AMD endgame is a HIP/ROCm XIO transport with compatible NIC queues and GPU-side doorbells. Apple Silicon remains a compelling unified-memory hybrid because public macOS APIs do not expose a general NIC-to-Metal DMA queue.
+
+The TCP semantics do not get rewritten for every vendor. Transport adapters must feed the same conversations to the same contract, or explain themselves to the test suite.
+
+## Is any of this useful?
+
+Surprisingly, yes, in narrow places:
+
+- GPU-heavy gateways where parsing, classification, inference, image work, hashing, or vector operations should continue without bouncing through several CPU abstractions
+- experiments that measure how much networking machinery can follow application compute onto the accelerator
+- deterministic CPU-versus-GPU crossover research using identical packet conversations
+- teaching protocol state machines, GPU memory models, atomics, and the hidden amount of work inside a boring HTTP response
+- making serious engineers briefly stare into the middle distance
+
+It is not a sensible replacement for Axum plus a database. It becomes interesting when thousands of independent requests already want GPU work.
+
+## Proof, not vibes
+
+Run the local proof suite:
 
 ```bash
 ./scripts/prove-gpu.sh
 ```
 
-The raw-packet championship reports:
-
-- engine requests/s
-- end-to-end harness requests/s
-- represented wire packets/s
-- response MiB/s
-- p50 and p99 batch-round latency
-- handshake flows/s
-- packets per GPU dispatch
-- the selected GPU adapter
-- GPU-to-CPU-reference ratio
-
-Use a larger arena on real hardware:
+Or enlarge the arena:
 
 ```bash
 GPUT_PROOF_FLOWS=8192 \
@@ -163,101 +208,62 @@ GPUT_PROOF_BATCH_SIZE=512 \
 ./scripts/prove-gpu.sh
 ```
 
-The CPU row is a straightforward single-threaded semantic reference, not the Linux kernel and not the best possible CPU stack. CI uses Lavapipe to prove correctness, not discrete-GPU speed. See [docs/PROOF.md](docs/PROOF.md) for the evidence contract and [BENCHMARKING.md](BENCHMARKING.md) for fair comparison rules.
+The suite validates CPU and GPU packet semantics, retransmitted SYNs, duplicate data, hash collisions, checksums, HTTP statuses, sequence numbers, FIN cleanup, and throughput. The benchmark reports engine RPS, end-to-end RPS, represented wire packets/s, response MiB/s, handshake flows/s, p50/p99 round latency, packets per dispatch, adapter name, and the GPU-to-CPU-reference ratio.
 
-## What works
+The CPU packet engine is a deliberately straightforward single-threaded semantic reference. It is not Linux TCP, DPDK, AF_XDP, or the fastest CPU implementation we could write. A public victory claim also needs repeated hardware runs and an independent load generator. Fastest in the world remains a hypothesis with a benchmark harness attached, not a sticker we found behind the sofa.
 
-- a Tokio TCP listener with persistent HTTP/1.1 connections
-- basic HTTP/1.1 pipelining on the socket path
-- an Axum-style Rust `Router` and `routing::get`
-- router compilation into GPU route tables, response descriptors, bytecode and a string arena
-- binary-searched FNV-1a routing with exact collision-safe path comparison
-- bounded dynamic response composition from path, query, request size, path hash and backend
-- complete HTTP responses generated in WGSL
-- cursed but bounds-checked shader-side UTF-8 strings
-- CPU socket baseline and automatic fallback
-- `gput-bench` with persistent connections, concurrency sweeps, repeated runs, medians and JSON
-- vendor-neutral raw IPv4/TCP compute through Metal or Vulkan
+See [the proof contract](docs/PROOF.md) and [benchmark rules](BENCHMARKING.md).
+
+## What currently works
+
+- Axum-style `Router`, `routing::get`, `Response`, and bounded `Body` programs
+- exact collision-safe GPU routing
+- complete HTTP response construction in WGSL
+- cursed UTF-8 strings with malformed-input rejection
+- persistent HTTP/1.1 and basic pipelining on the socket path
+- CPU and GPU application processors consuming the same compiled router
+- raw IPv4/TCP packet parsing in compute
 - atomically claimed, collision-safe GPU flow slots
-- persistent sequence state and retransmitted SYN/data recovery
-- packet routes for `/plaintext` and `/health`, plus honest `400`, `404` and `405`
+- SYN, ACK, persistent sequence state, duplicate SYN/data recovery, FIN, and RST cleanup
+- `/plaintext`, `/health`, `400`, `404`, and `405` on the packet path
 - GPU-generated IPv4 and TCP checksums
-- batched TUN ingestion and per-dispatch telemetry
-- a CPU packet reference implementing the same narrow semantics
-- `gput-packet-bench` for identical raw packet workloads on CPU and GPU
-- synthetic collision/retransmission tests and real Linux TUN-to-GPU `curl` coverage
-- macOS build and shader-validation coverage
+- ordered dispatch waves for packets belonging to the same flow
+- batched TUN ingress with packet/dispatch telemetry
+- CPU packet reference and identical-workload packet benchmark
+- Linux TUN-to-GPU `curl` coverage and macOS build coverage
 
-## Run the socket application
+## The stubbornness stack
 
-```bash
-cargo run --release --locked -- --backend auto --bind 127.0.0.1:8080
+```text
+WGSL has no strings
+  -> byte arena + metadata + UTF-8 validation
+
+WGSL has no sockets
+  -> raw packets + flow table + checksums
+
+GPU threads dislike serial dependencies
+  -> independent-flow batching + ordered per-flow waves
+
+The NIC cannot portably DMA into wgpu buffers
+  -> TUN today, transport seam tomorrow
+
+Somebody asks whether this should exist
+  -> additional test coverage
 ```
-
-The built-in application exposes:
-
-| Route | Response |
-| --- | --- |
-| `/` | project metadata as JSON |
-| `/health` | `ok` |
-| `/hello` | proof of the selected processor |
-| `/plaintext` | exactly `Hello, World!` |
-| `/utf8` | an unnecessarily GPU-generated Swedish owl-and-crab payload |
-| `/inspect?anything` | path, query, request size, path hash and backend |
-| anything else | `404 Not Found` |
-
-Force a backend:
-
-```bash
-cargo run --release --locked -- --backend gpu
-cargo run --release --locked -- --backend cpu
-```
-
-Useful tuning knobs:
-
-```bash
-cargo run --release --locked -- \
-  --backend gpu \
-  --batch-size 256 \
-  --batch-wait-micros 50 \
-  --queue-depth 8192 \
-  --max-request-bytes 4096 \
-  --response-slot-bytes 512
-```
-
-`WGPU_BACKEND` and `WGPU_ADAPTER_NAME` can influence adapter selection.
-
-## Benchmark real HTTP servers
-
-```bash
-cargo run --release --locked --bin gput-bench -- suite \
-  --address 127.0.0.1:8080 \
-  --path /plaintext \
-  --requests 100000 \
-  --suite-concurrency 1,16,64,256,1024 \
-  --repeats 5 \
-  --pipeline 1 \
-  --label gput-gpu \
-  --expected-backend gpu
-```
-
-Point the same client at Axum, Actix, Hyper, Go, C++ or another implementation without `--expected-backend`. Public claims should also be corroborated with an independent generator such as `wrk` or `oha`.
-
-To benchmark the real TUN/GPU TCP path, start `gput-packetd` and point `gput-bench` at `10.77.0.2:8080` with `--pipeline 1`.
-
-## Documentation
-
-- [Benchmark rules](BENCHMARKING.md)
-- [GPU networking architecture](docs/GPU_NETWORKING.md)
-- [Proof and claim boundaries](docs/PROOF.md)
-- [Repository rules](AGENTS.md)
 
 ## Honest limitations
 
 This is not a production web server or an RFC-complete TCP stack.
 
-The socket path has no TLS, request bodies, HTTP/2, HTTP/3, path parameters, arbitrary middleware, mutable GPU string heap or zero-copy NIC integration. The packet path still lacks retransmission timers, congestion control, receive-window accounting, bounded out-of-order reassembly, SYN-flood protection, IPv6, PMTU handling and HTTP stream reassembly for several requests carried by one TCP segment.
+The socket path has no TLS, request bodies, HTTP/2, HTTP/3, path parameters, arbitrary middleware, mutable GPU heap, or zero-copy NIC integration. The packet path still lacks retransmission timers, congestion control, receive-window accounting, bounded out-of-order reassembly, SYN-flood protection, IPv6, PMTU handling, and stream reassembly for several HTTP requests carried by one TCP segment.
 
-TUN still crosses the host networking boundary. The direct AMD destination is a HIP/ROCm XIO packet transport, with AF_XDP as the nearer Linux kernel-bypass step. macOS remains a unified-memory hybrid because Apple does not expose a public general-purpose NIC-to-Metal DMA queue.
+TUN still crosses the host networking boundary. Software Vulkan proves semantics, not speed. A GPU result is only a GPU result when the selected adapter, driver, commands, and repeated measurements are published beside it.
 
-What exists today is intentionally narrower but real: persistent TCP state, HTTP routing and checksummed packet generation execute in a portable compute shader, survive common retransmissions, separate colliding flows, batch independent connections and serve an ordinary TCP client. The project has escaped the HTTP layer and started eating the network stack one measurable bite at a time.
+## More entrails
+
+- [GPU networking architecture](docs/GPU_NETWORKING.md)
+- [Proof and claim boundaries](docs/PROOF.md)
+- [Benchmark methodology](BENCHMARKING.md)
+- [Repository rules](AGENTS.md)
+
+Work normally goes directly to `main`. The repository is an experiment, not a parliament. Commits should still be coherent enough that future us can identify which particular act of stubbornness broke the owl. 🦉

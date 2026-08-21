@@ -15,6 +15,17 @@ This repository is an experiment, not a parliament.
 - No fake GPU backend. A request reported as GPU processed must have passed through an actual compute dispatch and readback.
 - Avoid unsafe Rust unless there is a measured, documented reason and the user explicitly approves it.
 
+## Project voice
+
+This is a technically serious ploy project. The writing should make that obvious without turning every paragraph into stand-up comedy.
+
+- Prefer dry technical humour, precise absurdity, and phrases such as "buffers, bit shifts, and stubbornness" over generic hype or AI-flavoured marketing sludge.
+- Keep the first five minutes obvious. A newcomer should quickly find `cargo doctor`, `cargo serve`, `cargo hello-gpu`, `cargo prove-gpu`, and `cargo packetd`.
+- Jokes may decorate evidence, never replace it. Do not hide limitations, software adapters, fallback backends, or losing benchmark results.
+- Never call gput the fastest in the world without reproducible hardware results and a fair comparison. It is acceptable, and encouraged, to describe that outcome as a hypothesis currently carrying a benchmark harness.
+- Error messages and help text may have personality, but must still say exactly what failed and how to repair it.
+- Preserve the recurring project ingredients: storage buffers, atomics, UTF-8, raw packets, owls, crabs, and unreasonable stubbornness.
+
 ## Router contract
 
 The Rust router API is allowed to feel like a normal web framework. Its implementation must remain honest about where request work happens.
@@ -33,7 +44,7 @@ The Rust router API is allowed to feel like a normal web framework. Its implemen
 - The built-in HTTP benchmark should be usable against non-gput servers. Do not bake competitor-specific shortcuts into the client.
 - The raw-packet benchmark must feed equivalent packet conversations to CPU and GPU backends and validate responses outside the timed engine section.
 - State clearly that `CpuPacketEngine` is a single-threaded semantic reference, not the Linux kernel or the best possible CPU stack.
-- Prefer medians across repeated runs over cherry-picked peaks. Report latency beside throughput and print the GPU adapter.
+- Prefer medians across repeated runs over cherry-picked peaks. Report latency alongside throughput and print the GPU adapter.
 - Keep `/plaintext` boring. It exists to expose transport and dispatch overhead, not to manufacture a GPU-friendly victory.
 - Benchmark changes need socket or packet-level coverage, not only parser unit tests.
 - CI correctness results from Lavapipe are not discrete-GPU performance numbers.
