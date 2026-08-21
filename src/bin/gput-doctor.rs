@@ -5,8 +5,7 @@ use clap::Parser;
 use gput::{
     packet::{
         FlowKey, GpuPacketEngine, PacketEngine, PacketEngineConfig, RawPacket, TCP_ACK, TCP_PSH,
-        TCP_SYN, TcpPacketSpec, build_ipv4_tcp_packet, parse_ipv4_tcp,
-        validate_ipv4_tcp_checksums,
+        TCP_SYN, TcpPacketSpec, build_ipv4_tcp_packet, parse_ipv4_tcp, validate_ipv4_tcp_checksums,
     },
     processor::{GpuProcessor, Processor, ProcessorLimits},
 };
@@ -90,7 +89,9 @@ fn main() -> Result<()> {
         );
     }
 
-    println!("\nprognosis: the GPU path is real; whether it is fast is now the benchmark's problem");
+    println!(
+        "\nprognosis: the GPU path is real; whether it is fast is now the benchmark's problem"
+    );
     println!("  next: cargo serve --backend gpu");
     println!("        cargo prove-gpu");
     println!("        cargo packet-bench --backend both");
@@ -120,7 +121,10 @@ fn check_http_shader() -> Result<Duration> {
     })?;
     let request: &[u8] = b"GET /health HTTP/1.1\r\nHost: doctor\r\nConnection: close\r\n\r\n";
     let mut responses = processor.process_batch(&[request])?;
-    ensure!(responses.len() == 1, "GPU returned the wrong response count");
+    ensure!(
+        responses.len() == 1,
+        "GPU returned the wrong response count"
+    );
     let response = responses.pop().expect("response count was checked");
     ensure!(
         response.starts_with(b"HTTP/1.1 200 OK\r\n"),
@@ -217,11 +221,7 @@ fn check_packet_shader() -> Result<(Duration, String)> {
     Ok((started.elapsed(), adapter_name))
 }
 
-fn one_packet(
-    engine: &impl PacketEngine,
-    input: RawPacket,
-    label: &str,
-) -> Result<RawPacket> {
+fn one_packet(engine: &impl PacketEngine, input: RawPacket, label: &str) -> Result<RawPacket> {
     let mut output = engine.process_batch(&[input])?;
     output
         .pop()
