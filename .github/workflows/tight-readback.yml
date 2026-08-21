@@ -1,4 +1,4 @@
-name: land tight packet readback
+name: land rustfmt-shaped tight packet readback
 
 on:
   push:
@@ -75,7 +75,7 @@ jobs:
           cat /tmp/gput-wide.json
 
       - name: Tighten output slots and combine readback
-        run: python3 scripts/tight-readback.py
+        run: python3 scripts/run-tight-readback.py
 
       - name: Format, lint, test and build every binary
         shell: bash
@@ -141,7 +141,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm \
             .github/workflows/tight-readback.yml \
-            scripts/tight-readback.py
+            scripts/tight-readback.py \
+            scripts/run-tight-readback.py
           git add -- \
             src/packet/mod.rs \
             src/packet/packet.wgsl
