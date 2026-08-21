@@ -77,6 +77,22 @@ jobs:
                 --json > "/tmp/gput-word-before-${run}.json"
           done
 
+      - name: Repair bootstrap replacement escaping
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/packet-word-fastpath.py")
+          source = path.read_text()
+          old = "updated, count = re.subn(pattern, replacement, source, count=1, flags=re.DOTALL)"
+          new = "updated, count = re.subn(pattern, lambda _match: replacement, source, count=1, flags=re.DOTALL)"
+          if old not in source:
+              raise SystemExit("expected regex replacement helper was not found")
+          path.write_text(source.replace(old, new, 1))
+          PY
+
       - name: Apply aligned response templates and checksum sums
         run: python3 scripts/packet-word-fastpath.py
 
