@@ -35,6 +35,15 @@ The Rust router API is allowed to feel like a normal web framework. Its implemen
 - Keep `/plaintext` boring. It exists to expose transport and dispatch overhead, not to manufacture a GPU-friendly victory.
 - Benchmark changes need socket-level coverage for persistence and pipelining, not just parser unit tests.
 
+## GPU packet contract
+
+- Keep packet ingress and egress separate from protocol semantics. `RawPacket -> PacketEngine -> RawPacket` is the portability boundary.
+- The portable packet engine is WGSL through `wgpu`, so the same protocol state machine can run on Metal and Vulkan.
+- TCP flow state belongs in persistent GPU-visible storage. Do not quietly hand established-flow state back to a CPU socket implementation.
+- Vendor-direct transports such as ROCm XIO or DOCA are packet sources and sinks, not excuses to fork TCP semantics.
+- IPv4 and TCP checksums for GPU-generated packets belong in the packet shader path.
+- The current packet engine is an experimental fast path, not an RFC-complete TCP stack. Do not expose it as production-safe until retransmission, congestion control, windows, out-of-order handling, collision-safe flow lookup, SYN-flood protection, and IPv6 are addressed.
+
 ## Scope
 
 The current target is intentionally narrow:
@@ -46,5 +55,6 @@ The current target is intentionally narrow:
 - bounded response programs
 - batched compute dispatch through `wgpu`
 - CPU baseline and automatic fallback
+- an experimental raw IPv4/TCP GPU packet fast path for `/plaintext`
 
 Do not add TLS, HTTP/2, HTTP/3, a database, arbitrary middleware, or a general GPU heap until measurements justify expanding the blast radius.
