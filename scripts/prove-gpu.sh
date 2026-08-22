@@ -7,14 +7,15 @@ warmup_requests_per_flow="${GPUT_PROOF_WARMUP_REQUESTS_PER_FLOW:-20}"
 batch_size="${GPUT_PROOF_BATCH_SIZE:-65536}"
 flow_capacity="${GPUT_PROOF_FLOW_CAPACITY:-131072}"
 flow_probe_limit="${GPUT_PROOF_FLOW_PROBE_LIMIT:-64}"
+target_dir="${CARGO_TARGET_DIR:-target}"
 
 cargo build --release --locked --bins
 
 printf '\n===== GPU packet semantics =====\n'
-target/release/gput-packet-demo
+"$target_dir/release/gput-packet-demo"
 
 printf '\n===== Same raw packets, CPU reference versus GPU =====\n'
-target/release/gput-packet-bench \
+"$target_dir/release/gput-packet-bench" \
   --backend both \
   --flows "$flows" \
   --requests-per-flow "$requests_per_flow" \
