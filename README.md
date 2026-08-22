@@ -45,7 +45,7 @@ cargo prove-gpu
 Compare identical raw IPv4/TCP conversations on the CPU reference and GPU engine:
 
 ```bash
-cargo packet-bench --backend both --flows 4096 --requests-per-flow 1000
+cargo packet-bench --backend both
 ```
 
 ## Write normal-looking server code, produce abnormal machinery
@@ -199,16 +199,17 @@ Run the local proof suite:
 ./scripts/prove-gpu.sh
 ```
 
-Or enlarge the arena:
+Or enlarge the arena while keeping one full independent-flow round in each dispatch:
 
 ```bash
-GPUT_PROOF_FLOWS=8192 \
+GPUT_PROOF_FLOWS=65536 \
 GPUT_PROOF_REQUESTS_PER_FLOW=2000 \
-GPUT_PROOF_BATCH_SIZE=512 \
+GPUT_PROOF_BATCH_SIZE=65536 \
+GPUT_PROOF_FLOW_CAPACITY=131072 \
 ./scripts/prove-gpu.sh
 ```
 
-The suite validates CPU and GPU packet semantics, retransmitted SYNs, duplicate data, hash collisions, checksums, HTTP statuses, sequence numbers, FIN cleanup, and throughput. The benchmark reports engine RPS, end-to-end RPS, represented wire packets/s, response MiB/s, handshake flows/s, p50/p99 round latency, packets per dispatch, adapter name, and the GPU-to-CPU-reference ratio.
+The suite validates CPU and GPU packet semantics, retransmitted SYNs, duplicate data, hash collisions, checksums, HTTP statuses, sequence numbers, FIN cleanup, and throughput. The benchmark reports engine RPS, end-to-end RPS, represented wire packets/s, response MiB/s, handshake flows/s, p50/p99 round latency, packets per dispatch, adapter name, per-stage timing, and the GPU-to-CPU-reference ratio.
 
 The CPU packet engine is a deliberately straightforward single-threaded semantic reference. It is not Linux TCP, DPDK, AF_XDP, or the fastest CPU implementation we could write. A public victory claim also needs repeated hardware runs and an independent load generator. Fastest in the world remains a hypothesis with a benchmark harness attached, not a sticker we found behind the sofa.
 
@@ -228,6 +229,8 @@ See [the proof contract](docs/PROOF.md) and [benchmark rules](BENCHMARKING.md).
 - `/plaintext`, `/health`, `400`, `404`, and `405` on the packet path
 - GPU-generated IPv4 and TCP checksums, with precomputed static payload sums
 - word-packed HTTP response templates copied four bytes at a time instead of knitted byte by byte
+- compact request and packet uploads instead of padding every item to its maximum slot size
+- atomic flow-slot claims with ordinary per-flow sequence fields once ownership is established
 - ordered dispatch waves for packets belonging to the same flow
 - batched TUN ingress with packet/dispatch telemetry
 - CPU packet reference and identical-workload packet benchmark

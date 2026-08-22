@@ -89,10 +89,10 @@ The request does not terminate in a normal server TCP socket. The host kernel ro
 ```bash
 cargo run --release --locked --bin gput-packet-bench -- \
   --backend both \
-  --flows 4096 \
+  --flows 32768 \
   --requests-per-flow 1000 \
-  --batch-size 256 \
-  --flow-capacity 16384 \
+  --batch-size 32768 \
+  --flow-capacity 65536 \
   --flow-probe-limit 64
 ```
 
@@ -117,6 +117,8 @@ GPU wave 2:
 
 Different flows run in parallel; the ordering dependency within each flow remains explicit. The TUN adapter gathers packets for a small configurable window before calling the engine, which finally gives the GPU a chance to eat a meal rather than being served one byte canapé per dispatch.
 
+Input metadata carries a compact word offset for each packet. A 70-byte request therefore uploads roughly 70 bytes, not a zero-padded 1,536-byte MTU slot. The buffers retain full MTU capacity without making every small packet pay for it on the queue.
+
 ## Flow-table design
 
 Each GPU flow slot stores:
@@ -132,7 +134,7 @@ last client segment coordinates
 last emitted response coordinates
 ```
 
-The FNV hash selects an initial slot only. Bounded linear probing and exact four-tuple comparison decide identity. Slots are claimed with storage atomics, and released entries become tombstones so deleting one connection cannot make a later colliding flow unreachable.
+The FNV hash selects an initial slot only. Bounded linear probing and exact four-tuple comparison decide identity. Slot state is claimed and published with storage atomics. Once published, the scheduler guarantees at most one packet for a flow in a dispatch, so sequence and retransmission fields use ordinary storage loads and stores instead of paying for atomics that cannot resolve a dependency anyway. Released entries become tombstones so deleting one connection cannot make a later colliding flow unreachable.
 
 The probe bound is configurable. Exhausting it drops the new flow rather than corrupting another connection.
 

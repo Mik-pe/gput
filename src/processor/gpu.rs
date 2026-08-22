@@ -41,9 +41,9 @@ struct Params {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct RequestMeta {
     input_len: u32,
+    word_offset: u32,
     _padding_0: u32,
     _padding_1: u32,
-    _padding_2: u32,
 }
 
 #[repr(C)]
@@ -169,7 +169,7 @@ impl GpuProcessor {
             required_features: wgpu::Features::empty(),
             required_limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))
         .context("failed to create wgpu device")?;
@@ -413,32 +413,12 @@ impl GpuProcessor {
         }
 
         let request_count = requests.len();
-        self.input_words_scratch
-            .resize(request_count * self.request_stride_words, 0);
-        self.request_meta_scratch.clear();
-
-        for (request_index, request) in requests.iter().enumerate() {
-            if request.len() > self.max_request_bytes {
-                bail!(
-                    "request {request_index} is {} bytes; GPU slot capacity is {}",
-                    request.len(),
-                    self.max_request_bytes
-                );
-            }
-
-            pack_request_words(
-                request,
-                &mut self.input_words_scratch[request_index * self.request_stride_words
-                    ..(request_index + 1) * self.request_stride_words],
-            );
-            self.request_meta_scratch.push(RequestMeta {
-                input_len: u32::try_from(request.len())
-                    .context("request length does not fit u32")?,
-                _padding_0: 0,
-                _padding_1: 0,
-                _padding_2: 0,
-            });
-        }
+        pack_request_batch(
+            requests,
+            self.max_request_bytes,
+            &mut self.request_meta_scratch,
+            &mut self.input_words_scratch,
+        )?;
 
         let params = Params {
             request_stride_words: u32::try_from(self.request_stride_words)
@@ -635,6 +615,42 @@ fn pack_request_words(request: &[u8], destination: &mut [u32]) {
     destination[..request.len()].copy_from_slice(request);
 }
 
+fn pack_request_batch(
+    requests: &[&[u8]],
+    max_request_bytes: usize,
+    metadata: &mut Vec<RequestMeta>,
+    words: &mut Vec<u32>,
+) -> Result<()> {
+    metadata.clear();
+    words.clear();
+
+    for (request_index, request) in requests.iter().enumerate() {
+        if request.len() > max_request_bytes {
+            bail!(
+                "request {request_index} is {} bytes; GPU slot capacity is {max_request_bytes}",
+                request.len()
+            );
+        }
+
+        let word_offset = words.len();
+        let request_words = words_for_bytes(request.len())?;
+        words.resize(word_offset + request_words, 0);
+        words[word_offset..].fill(0);
+        pack_request_words(
+            request,
+            &mut words[word_offset..word_offset + request_words],
+        );
+        metadata.push(RequestMeta {
+            input_len: u32::try_from(request.len()).context("request length does not fit u32")?,
+            word_offset: u32::try_from(word_offset)
+                .context("request word offset does not fit u32")?,
+            _padding_0: 0,
+            _padding_1: 0,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +678,24 @@ mod tests {
 
         assert_eq!(words[0], 0x2054_4547);
         assert_eq!(words[1], 0x0000_002f);
+    }
+
+    #[test]
+    fn packs_requests_back_to_back_instead_of_padding_every_maximum_slot() {
+        let requests = [b"GET".as_slice(), b"/plaintext".as_slice()];
+        let mut metadata = Vec::new();
+        let mut words = Vec::new();
+
+        pack_request_batch(&requests, 4_096, &mut metadata, &mut words).expect("requests pack");
+
+        assert_eq!(metadata[0].word_offset, 0);
+        assert_eq!(metadata[1].word_offset, 1);
+        assert_eq!(words.len(), 4);
+        assert_eq!(&bytemuck::cast_slice::<u32, u8>(&words)[..3], b"GET");
+        assert_eq!(
+            &bytemuck::cast_slice::<u32, u8>(&words)[4..14],
+            b"/plaintext"
+        );
     }
 
     #[test]

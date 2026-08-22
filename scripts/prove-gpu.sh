@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-flows="${GPUT_PROOF_FLOWS:-1024}"
-requests_per_flow="${GPUT_PROOF_REQUESTS_PER_FLOW:-100}"
-warmup_requests_per_flow="${GPUT_PROOF_WARMUP_REQUESTS_PER_FLOW:-10}"
-batch_size="${GPUT_PROOF_BATCH_SIZE:-256}"
-flow_capacity="${GPUT_PROOF_FLOW_CAPACITY:-16384}"
+flows="${GPUT_PROOF_FLOWS:-32768}"
+requests_per_flow="${GPUT_PROOF_REQUESTS_PER_FLOW:-1000}"
+warmup_requests_per_flow="${GPUT_PROOF_WARMUP_REQUESTS_PER_FLOW:-20}"
+batch_size="${GPUT_PROOF_BATCH_SIZE:-32768}"
+flow_capacity="${GPUT_PROOF_FLOW_CAPACITY:-65536}"
 flow_probe_limit="${GPUT_PROOF_FLOW_PROBE_LIMIT:-64}"
 
 cargo build --release --locked --bins

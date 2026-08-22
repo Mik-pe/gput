@@ -38,6 +38,23 @@ pub fn parse_ipv4_tcp(packet: &RawPacket) -> Option<TcpPacketView<'_>> {
     parse_ipv4_tcp_bytes(packet.as_bytes())
 }
 
+pub(super) fn scheduling_flow_key(packet: &RawPacket) -> Option<FlowKey> {
+    let bytes = packet.as_bytes();
+    if bytes.len() < 24 || bytes[0] >> 4 != 4 || bytes[9] != 6 {
+        return None;
+    }
+    let ip_header_len = usize::from(bytes[0] & 0x0f) * 4;
+    if ip_header_len < 20 || ip_header_len + 4 > bytes.len() {
+        return None;
+    }
+    Some(FlowKey {
+        src_ip: read_u32(bytes, 12),
+        dst_ip: read_u32(bytes, 16),
+        src_port: read_u16(bytes, ip_header_len),
+        dst_port: read_u16(bytes, ip_header_len + 2),
+    })
+}
+
 pub fn build_ipv4_tcp_packet(spec: TcpPacketSpec<'_>) -> Result<RawPacket> {
     let total_len = 40_usize
         .checked_add(spec.payload.len())
@@ -232,5 +249,6 @@ mod tests {
         assert_eq!(parsed.flags, TCP_ACK | TCP_PSH);
         assert_eq!(parsed.payload, b"GET /plaintext HTTP/1.1\r\n\r\n");
         validate_ipv4_tcp_checksums(&packet).expect("checksums are valid");
+        assert_eq!(scheduling_flow_key(&packet), Some(key));
     }
 }

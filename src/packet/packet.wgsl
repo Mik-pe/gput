@@ -1,8 +1,8 @@
 struct PacketMeta {
     len: u32,
+    word_offset: u32,
     pad0: u32,
     pad1: u32,
-    pad2: u32,
 }
 
 struct EngineParams {
@@ -16,11 +16,30 @@ struct EngineParams {
     pad1: u32,
 }
 
+struct FlowSlot {
+    state: atomic<u32>,
+    key_hash: u32,
+    src_ip: u32,
+    dst_ip: u32,
+    ports: u32,
+    recv_next: u32,
+    send_next: u32,
+    send_unacked: u32,
+    last_client_seq: u32,
+    last_client_len: u32,
+    last_response_seq: u32,
+    last_response_ack: u32,
+    last_response_id: u32,
+    last_response_len: u32,
+    generation: u32,
+    padding: u32,
+}
+
 @group(0) @binding(0) var<storage, read> input_meta: array<PacketMeta>;
 @group(0) @binding(1) var<storage, read> input_words: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output_meta: array<PacketMeta>;
 @group(0) @binding(3) var<storage, read_write> output_words: array<u32>;
-@group(0) @binding(4) var<storage, read_write> flows: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> flows: array<FlowSlot>;
 @group(0) @binding(5) var<uniform> params: EngineParams;
 
 const TCP_FIN: u32 = 0x01u;
@@ -36,70 +55,44 @@ const STATE_TOMBSTONE: u32 = 3u;
 const STATE_CLAIMED: u32 = 0xffffffffu;
 const INVALID_INDEX: u32 = 0xffffffffu;
 
-const FLOW_STATE: u32 = 0u;
-const FLOW_KEY_HASH: u32 = 1u;
-const FLOW_SRC_IP: u32 = 2u;
-const FLOW_DST_IP: u32 = 3u;
-const FLOW_PORTS: u32 = 4u;
-const FLOW_RECV_NEXT: u32 = 5u;
-const FLOW_SEND_NEXT: u32 = 6u;
-const FLOW_SEND_UNACKED: u32 = 7u;
-const FLOW_LAST_CLIENT_SEQ: u32 = 8u;
-const FLOW_LAST_CLIENT_LEN: u32 = 9u;
-const FLOW_LAST_RESPONSE_SEQ: u32 = 10u;
-const FLOW_LAST_RESPONSE_ACK: u32 = 11u;
-const FLOW_LAST_RESPONSE_ID: u32 = 12u;
-const FLOW_LAST_RESPONSE_LEN: u32 = 13u;
-const FLOW_GENERATION: u32 = 14u;
-
 fn read_byte(packet_index: u32, byte_index: u32) -> u32 {
-    let base = packet_index * params.input_stride_words;
+    let base = input_meta[packet_index].word_offset;
     let word = input_words[base + byte_index / 4u];
     return (word >> ((byte_index & 3u) * 8u)) & 0xffu;
 }
 
-fn read_output_byte(packet_index: u32, byte_index: u32) -> u32 {
-    let base = packet_index * params.output_stride_words;
-    let word = output_words[base + byte_index / 4u];
-    return (word >> ((byte_index & 3u) * 8u)) & 0xffu;
-}
-
-fn write_byte(packet_index: u32, byte_index: u32, value: u32) {
-    let base = packet_index * params.output_stride_words;
-    let word_index = base + byte_index / 4u;
-    let shift = (byte_index & 3u) * 8u;
-    let mask = 0xffu << shift;
-    output_words[word_index] =
-        (output_words[word_index] & ~mask) | ((value & 0xffu) << shift);
+fn byte_swap_u32(value: u32) -> u32 {
+    return ((value & 0x000000ffu) << 24u) |
+        ((value & 0x0000ff00u) << 8u) |
+        ((value & 0x00ff0000u) >> 8u) |
+        ((value & 0xff000000u) >> 24u);
 }
 
 fn read_u16_be(packet_index: u32, offset: u32) -> u32 {
-    return (read_byte(packet_index, offset) << 8u) |
-        read_byte(packet_index, offset + 1u);
+    let base = input_meta[packet_index].word_offset;
+    let word = input_words[base + offset / 4u];
+    let pair = (word >> ((offset & 2u) * 8u)) & 0xffffu;
+    return ((pair & 0xffu) << 8u) | (pair >> 8u);
 }
 
 fn read_u32_be(packet_index: u32, offset: u32) -> u32 {
-    return (read_byte(packet_index, offset) << 24u) |
-        (read_byte(packet_index, offset + 1u) << 16u) |
-        (read_byte(packet_index, offset + 2u) << 8u) |
-        read_byte(packet_index, offset + 3u);
-}
-
-fn read_output_u16_be(packet_index: u32, offset: u32) -> u32 {
-    return (read_output_byte(packet_index, offset) << 8u) |
-        read_output_byte(packet_index, offset + 1u);
+    let base = input_meta[packet_index].word_offset;
+    return byte_swap_u32(input_words[base + offset / 4u]);
 }
 
 fn write_u16_be(packet_index: u32, offset: u32, value: u32) {
-    write_byte(packet_index, offset, value >> 8u);
-    write_byte(packet_index, offset + 1u, value);
+    let base = packet_index * params.output_stride_words;
+    let word_index = base + offset / 4u;
+    let shift = (offset & 2u) * 8u;
+    let mask = 0xffffu << shift;
+    let swapped = ((value & 0xffu) << 8u) | ((value >> 8u) & 0xffu);
+    output_words[word_index] =
+        (output_words[word_index] & ~mask) | (swapped << shift);
 }
 
 fn write_u32_be(packet_index: u32, offset: u32, value: u32) {
-    write_byte(packet_index, offset, value >> 24u);
-    write_byte(packet_index, offset + 1u, value >> 16u);
-    write_byte(packet_index, offset + 2u, value >> 8u);
-    write_byte(packet_index, offset + 3u, value);
+    let base = packet_index * params.output_stride_words;
+    output_words[base + offset / 4u] = byte_swap_u32(value);
 }
 
 fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32) -> u32 {
@@ -109,14 +102,6 @@ fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32) -> u32 {
     hash = (hash ^ src_port) * 16777619u;
     hash = (hash ^ dst_port) * 16777619u;
     return hash;
-}
-
-fn flow_load(base: u32, field: u32) -> u32 {
-    return atomicLoad(&flows[base + field]);
-}
-
-fn flow_store(base: u32, field: u32, value: u32) {
-    atomicStore(&flows[base + field], value);
 }
 
 fn packed_ports(src_port: u32, dst_port: u32) -> u32 {
@@ -130,10 +115,10 @@ fn flow_matches(
     dst_ip: u32,
     ports: u32,
 ) -> bool {
-    return flow_load(base, FLOW_KEY_HASH) == key_hash &&
-        flow_load(base, FLOW_SRC_IP) == src_ip &&
-        flow_load(base, FLOW_DST_IP) == dst_ip &&
-        flow_load(base, FLOW_PORTS) == ports;
+    return flows[base].key_hash == key_hash &&
+        flows[base].src_ip == src_ip &&
+        flows[base].dst_ip == dst_ip &&
+        flows[base].ports == ports;
 }
 
 fn flow_find(
@@ -149,8 +134,8 @@ fn flow_find(
             break;
         }
         let slot = (key_hash + probe) & (params.flow_capacity - 1u);
-        let base = slot * FLOW_WORDS;
-        let state = flow_load(base, FLOW_STATE);
+        let base = slot;
+        let state = atomicLoad(&flows[base].state);
         if state == STATE_FREE {
             return INVALID_INDEX;
         }
@@ -176,27 +161,30 @@ fn flow_claim(
             break;
         }
         let slot = (key_hash + probe) & (params.flow_capacity - 1u);
-        let base = slot * FLOW_WORDS;
-        let state = flow_load(base, FLOW_STATE);
+        let base = slot;
+        let state = atomicLoad(&flows[base].state);
         if state == STATE_FREE || state == STATE_TOMBSTONE {
             let claim = atomicCompareExchangeWeak(
-                &flows[base + FLOW_STATE],
+                &flows[base].state,
                 state,
                 STATE_CLAIMED,
             );
             if claim.exchanged {
-                flow_store(base, FLOW_KEY_HASH, key_hash);
-                flow_store(base, FLOW_SRC_IP, src_ip);
-                flow_store(base, FLOW_DST_IP, dst_ip);
-                flow_store(base, FLOW_PORTS, ports);
-                var field = FLOW_RECV_NEXT;
-                loop {
-                    if field >= FLOW_WORDS {
-                        break;
-                    }
-                    flow_store(base, field, 0u);
-                    field += 1u;
-                }
+                flows[base].key_hash = key_hash;
+                flows[base].src_ip = src_ip;
+                flows[base].dst_ip = dst_ip;
+                flows[base].ports = ports;
+                flows[base].recv_next = 0u;
+                flows[base].send_next = 0u;
+                flows[base].send_unacked = 0u;
+                flows[base].last_client_seq = 0u;
+                flows[base].last_client_len = 0u;
+                flows[base].last_response_seq = 0u;
+                flows[base].last_response_ack = 0u;
+                flows[base].last_response_id = 0u;
+                flows[base].last_response_len = 0u;
+                flows[base].generation = 0u;
+                flows[base].padding = 0u;
                 return base;
             }
         }
@@ -206,12 +194,8 @@ fn flow_claim(
 }
 
 fn flow_release(base: u32) {
-    flow_store(
-        base,
-        FLOW_GENERATION,
-        flow_load(base, FLOW_GENERATION) + 1u,
-    );
-    flow_store(base, FLOW_STATE, STATE_TOMBSTONE);
+    flows[base].generation += 1u;
+    atomicStore(&flows[base].state, STATE_TOMBSTONE);
 }
 
 fn checksum_fold(input_sum: u32) -> u32 {
@@ -221,65 +205,44 @@ fn checksum_fold(input_sum: u32) -> u32 {
     return (~sum) & 0xffffu;
 }
 
-fn ipv4_checksum(packet_index: u32) -> u32 {
-    var sum = 0u;
-    var offset = 0u;
-    loop {
-        if offset >= 20u {
-            break;
-        }
-        if offset != 10u {
-            sum += read_output_u16_be(packet_index, offset);
-        }
-        offset += 2u;
-    }
+fn checksum_u32(value: u32) -> u32 {
+    return (value >> 16u) + (value & 0xffffu);
+}
+
+fn ipv4_checksum(packet_len: u32, src_ip: u32, dst_ip: u32) -> u32 {
+    var sum = 0x4500u + packet_len + 0x4000u + 0x4006u;
+    sum += checksum_u32(src_ip);
+    sum += checksum_u32(dst_ip);
     return checksum_fold(sum);
 }
 
-fn tcp_checksum(packet_index: u32, tcp_len: u32, response_id: u32) -> u32 {
-    var sum = 0u;
-    sum += read_output_u16_be(packet_index, 12u);
-    sum += read_output_u16_be(packet_index, 14u);
-    sum += read_output_u16_be(packet_index, 16u);
-    sum += read_output_u16_be(packet_index, 18u);
-    sum += 6u;
-    sum += tcp_len;
-
-    var offset = 20u;
-    loop {
-        if offset >= 40u {
-            break;
-        }
-        if offset != 36u {
-            sum += read_output_u16_be(packet_index, offset);
-        }
-        offset += 2u;
-    }
+fn tcp_checksum(
+    src_ip: u32,
+    dst_ip: u32,
+    src_port: u32,
+    dst_port: u32,
+    seq: u32,
+    ack: u32,
+    flags: u32,
+    tcp_len: u32,
+    response_id: u32,
+) -> u32 {
+    var sum = checksum_u32(src_ip) + checksum_u32(dst_ip) + 6u + tcp_len;
+    sum += src_port + dst_port;
+    sum += checksum_u32(seq) + checksum_u32(ack);
+    sum += 0x5000u | flags;
+    sum += 0xffffu;
     if response_id < RESPONSE_COUNT {
         sum += RESPONSE_CHECKSUM_SUMS[response_id];
     }
     return checksum_fold(sum);
 }
 
-fn clear_output_header(packet_index: u32) {
-    let base = packet_index * params.output_stride_words;
-    var word_index = 0u;
-    loop {
-        if word_index >= 10u {
-            break;
-        }
-        output_words[base + word_index] = 0u;
-        word_index += 1u;
-    }
-}
-
 fn write_ipv4(packet_index: u32, len: u32, src_ip: u32, dst_ip: u32) {
-    clear_output_header(packet_index);
-    write_byte(packet_index, 0u, 0x45u);
-    write_u16_be(packet_index, 2u, len);
-    write_u16_be(packet_index, 6u, 0x4000u);
-    write_byte(packet_index, 8u, 64u);
-    write_byte(packet_index, 9u, 6u);
+    let base = packet_index * params.output_stride_words;
+    output_words[base] = byte_swap_u32(0x45000000u | len);
+    output_words[base + 1u] = byte_swap_u32(0x00004000u);
+    output_words[base + 2u] = byte_swap_u32(0x40060000u);
     write_u32_be(packet_index, 12u, src_ip);
     write_u32_be(packet_index, 16u, dst_ip);
 }
@@ -292,21 +255,42 @@ fn write_tcp(
     ack: u32,
     flags: u32,
 ) {
-    write_u16_be(packet_index, 20u, src_port);
-    write_u16_be(packet_index, 22u, dst_port);
+    let base = packet_index * params.output_stride_words;
+    output_words[base + 5u] = byte_swap_u32((src_port << 16u) | dst_port);
     write_u32_be(packet_index, 24u, seq);
     write_u32_be(packet_index, 28u, ack);
-    write_byte(packet_index, 32u, 0x50u);
-    write_byte(packet_index, 33u, flags);
-    write_u16_be(packet_index, 34u, 65535u);
+    output_words[base + 8u] = byte_swap_u32(0x50000000u | (flags << 16u) | 0xffffu);
+    output_words[base + 9u] = 0u;
 }
 
-fn write_checksums(packet_index: u32, tcp_len: u32, response_id: u32) {
-    write_u16_be(packet_index, 10u, ipv4_checksum(packet_index));
+fn write_checksums(
+    packet_index: u32,
+    packet_len: u32,
+    src_ip: u32,
+    dst_ip: u32,
+    src_port: u32,
+    dst_port: u32,
+    seq: u32,
+    ack: u32,
+    flags: u32,
+    response_id: u32,
+) {
+    let tcp_len = packet_len - 20u;
+    write_u16_be(packet_index, 10u, ipv4_checksum(packet_len, src_ip, dst_ip));
     write_u16_be(
         packet_index,
         36u,
-        tcp_checksum(packet_index, tcp_len, response_id),
+        tcp_checksum(
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            seq,
+            ack,
+            flags,
+            tcp_len,
+            response_id,
+        ),
     );
 }
 
@@ -346,7 +330,18 @@ fn emit_packet(
     if response_id < RESPONSE_COUNT {
         write_http_response(packet_index, response_id);
     }
-    write_checksums(packet_index, 20u + payload_len, response_id);
+    write_checksums(
+        packet_index,
+        packet_len,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        flags,
+        response_id,
+    );
     output_meta[packet_index].len = packet_len;
 }
 
@@ -558,14 +553,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 return;
             }
             let isn = key_hash ^ 0xa5a55a5au;
-            flow_store(base, FLOW_RECV_NEXT, seq + 1u);
-            flow_store(base, FLOW_SEND_NEXT, isn + 1u);
-            flow_store(base, FLOW_SEND_UNACKED, isn);
-            flow_store(base, FLOW_LAST_RESPONSE_LEN, 0u);
-            flow_store(base, FLOW_STATE, STATE_SYN_RECEIVED);
+            flows[base].recv_next = seq + 1u;
+            flows[base].send_next = isn + 1u;
+            flows[base].send_unacked = isn;
+            flows[base].last_response_len = 0u;
+            atomicStore(&flows[base].state, STATE_SYN_RECEIVED);
         }
 
-        let state = flow_load(base, FLOW_STATE);
+        let state = atomicLoad(&flows[base].state);
         if state == STATE_SYN_RECEIVED {
             emit_packet(
                 packet_index,
@@ -573,8 +568,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 src_ip,
                 dst_port,
                 src_port,
-                flow_load(base, FLOW_SEND_NEXT) - 1u,
-                flow_load(base, FLOW_RECV_NEXT),
+                flows[base].send_next - 1u,
+                flows[base].recv_next,
                 TCP_SYN | TCP_ACK,
                 INVALID_INDEX,
             );
@@ -585,8 +580,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 src_ip,
                 dst_port,
                 src_port,
-                flow_load(base, FLOW_SEND_NEXT),
-                flow_load(base, FLOW_RECV_NEXT),
+                flows[base].send_next,
+                flows[base].recv_next,
                 TCP_ACK,
                 INVALID_INDEX,
             );
@@ -603,40 +598,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    var state = flow_load(base, FLOW_STATE);
+    var state = atomicLoad(&flows[base].state);
     if state == STATE_SYN_RECEIVED {
         if (flags & TCP_ACK) == 0u ||
-            ack != flow_load(base, FLOW_SEND_NEXT) ||
-            seq != flow_load(base, FLOW_RECV_NEXT) {
+            ack != flows[base].send_next ||
+            seq != flows[base].recv_next {
             return;
         }
-        flow_store(base, FLOW_STATE, STATE_ESTABLISHED);
-        flow_store(base, FLOW_SEND_UNACKED, ack);
+        atomicStore(&flows[base].state, STATE_ESTABLISHED);
+        flows[base].send_unacked = ack;
         state = STATE_ESTABLISHED;
     }
     if state != STATE_ESTABLISHED {
         return;
     }
 
-    if (flags & TCP_ACK) != 0u && ack == flow_load(base, FLOW_SEND_NEXT) {
-        flow_store(base, FLOW_SEND_UNACKED, ack);
+    if (flags & TCP_ACK) != 0u && ack == flows[base].send_next {
+        flows[base].send_unacked = ack;
     }
 
-    let recv_next = flow_load(base, FLOW_RECV_NEXT);
+    let recv_next = flows[base].recv_next;
     if seq != recv_next {
-        if seq == flow_load(base, FLOW_LAST_CLIENT_SEQ) &&
-            payload_len == flow_load(base, FLOW_LAST_CLIENT_LEN) &&
-            flow_load(base, FLOW_LAST_RESPONSE_LEN) > 0u {
+        if seq == flows[base].last_client_seq &&
+            payload_len == flows[base].last_client_len &&
+            flows[base].last_response_len > 0u {
             emit_packet(
                 packet_index,
                 dst_ip,
                 src_ip,
                 dst_port,
                 src_port,
-                flow_load(base, FLOW_LAST_RESPONSE_SEQ),
-                flow_load(base, FLOW_LAST_RESPONSE_ACK),
+                flows[base].last_response_seq,
+                flows[base].last_response_ack,
                 TCP_ACK | TCP_PSH,
-                flow_load(base, FLOW_LAST_RESPONSE_ID),
+                flows[base].last_response_id,
             );
         } else {
             emit_packet(
@@ -645,7 +640,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 src_ip,
                 dst_port,
                 src_port,
-                flow_load(base, FLOW_SEND_NEXT),
+                flows[base].send_next,
                 recv_next,
                 TCP_ACK,
                 INVALID_INDEX,
@@ -666,7 +661,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             src_ip,
             dst_port,
             src_port,
-            flow_load(base, FLOW_SEND_NEXT),
+            flows[base].send_next,
             next_ack,
             TCP_ACK,
             INVALID_INDEX,
@@ -681,15 +676,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if has_fin {
         next_ack += 1u;
     }
-    let response_seq = flow_load(base, FLOW_SEND_NEXT);
-    flow_store(base, FLOW_RECV_NEXT, next_ack);
-    flow_store(base, FLOW_SEND_NEXT, response_seq + response_len);
-    flow_store(base, FLOW_LAST_CLIENT_SEQ, seq);
-    flow_store(base, FLOW_LAST_CLIENT_LEN, payload_len);
-    flow_store(base, FLOW_LAST_RESPONSE_SEQ, response_seq);
-    flow_store(base, FLOW_LAST_RESPONSE_ACK, next_ack);
-    flow_store(base, FLOW_LAST_RESPONSE_ID, response_id);
-    flow_store(base, FLOW_LAST_RESPONSE_LEN, response_len);
+    let response_seq = flows[base].send_next;
+    flows[base].recv_next = next_ack;
+    flows[base].send_next = response_seq + response_len;
+    flows[base].last_client_seq = seq;
+    flows[base].last_client_len = payload_len;
+    flows[base].last_response_seq = response_seq;
+    flows[base].last_response_ack = next_ack;
+    flows[base].last_response_id = response_id;
+    flows[base].last_response_len = response_len;
 
     emit_packet(
         packet_index,

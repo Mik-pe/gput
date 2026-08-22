@@ -65,7 +65,11 @@ impl PacketEngine for CpuPacketEngine {
         "cpu-packet"
     }
 
-    fn process_batch(&self, packets: &[RawPacket]) -> Result<Vec<Option<RawPacket>>> {
+    fn process_batch_into(
+        &self,
+        packets: &[RawPacket],
+        output: &mut Vec<Option<RawPacket>>,
+    ) -> Result<()> {
         self.dispatches.fetch_add(1, Ordering::Relaxed);
         self.packets
             .fetch_add(packets.len() as u64, Ordering::Relaxed);
@@ -73,16 +77,19 @@ impl PacketEngine for CpuPacketEngine {
             .flows
             .lock()
             .map_err(|_| anyhow::anyhow!("CPU packet flow table poisoned"))?;
-        packets
-            .iter()
-            .map(|packet| process_packet(&mut flows, self.config, packet))
-            .collect()
+        output.clear();
+        output.reserve(packets.len());
+        for packet in packets {
+            output.push(process_packet(&mut flows, self.config, packet)?);
+        }
+        Ok(())
     }
 
     fn metrics(&self) -> PacketEngineMetrics {
         PacketEngineMetrics {
             dispatches: self.dispatches.load(Ordering::Relaxed),
             packets: self.packets.load(Ordering::Relaxed),
+            ..PacketEngineMetrics::default()
         }
     }
 }

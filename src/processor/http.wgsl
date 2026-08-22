@@ -11,9 +11,9 @@ struct Params {
 
 struct RequestMeta {
     input_len: u32,
+    word_offset: u32,
     _padding_0: u32,
     _padding_1: u32,
-    _padding_2: u32,
 };
 
 struct ResponseMeta {
@@ -102,7 +102,7 @@ const RESPONSE_FLAG_INVALID_UTF8: u32 = 2u;
 const RESPONSE_FLAG_INVALID_PROGRAM: u32 = 4u;
 
 fn request_byte(request_index: u32, byte_index: u32) -> u32 {
-    let word_index = request_index * params.request_stride_words + byte_index / 4u;
+    let word_index = request_meta[request_index].word_offset + byte_index / 4u;
     let shift = (byte_index & 3u) * 8u;
     return (input_words[word_index] >> shift) & 255u;
 }

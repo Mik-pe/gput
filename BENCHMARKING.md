@@ -61,15 +61,17 @@ The packet benchmark removes the kernel server socket from the measured engine a
 ```bash
 cargo run --release --locked --bin gput-packet-bench -- \
   --backend both \
-  --flows 4096 \
+  --flows 32768 \
   --requests-per-flow 1000 \
   --warmup-requests-per-flow 20 \
-  --batch-size 256 \
-  --flow-capacity 16384 \
+  --batch-size 32768 \
+  --flow-capacity 65536 \
   --flow-probe-limit 64
 ```
 
 Every flow performs a raw SYN handshake, repeated persistent `/plaintext` exchanges and FIN cleanup. Every emitted IPv4/TCP checksum, sequence number, acknowledgement, status and body is validated outside the timed engine section.
+
+The throughput profile keeps one independent-flow round in one dispatch. Reducing `--batch-size` is a useful latency and underfilled-ingress experiment, but it mostly measures repeated submit/readback overhead rather than saturated GPU packet work.
 
 The CPU reference is deliberately straightforward and single-threaded. It exists to answer the crossover question for this exact state machine. It is not a substitute for comparisons against an optimized kernel stack, DPDK, AF_XDP or a production framework.
 
@@ -83,6 +85,7 @@ The report includes:
 - packets per GPU dispatch
 - handshake flows/s
 - adapter name
+- per-packet scheduler, packing, upload, submit, GPU/readback and decode timing
 - GPU-to-CPU-reference ratio when both are run
 
 Use `--json` for machine-readable results.

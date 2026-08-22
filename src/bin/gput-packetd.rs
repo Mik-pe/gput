@@ -123,6 +123,7 @@ fn main() -> Result<()> {
 
     let mut buffer = vec![0_u8; usize::from(cli.mtu).max(2048)];
     let mut batch = Vec::with_capacity(cli.batch_capacity);
+    let mut responses = Vec::with_capacity(cli.batch_capacity);
     let batch_wait = Duration::from_micros(cli.batch_wait_micros);
     let stats_interval = Duration::from_secs(cli.stats_interval_secs);
     let started = Instant::now();
@@ -165,7 +166,8 @@ fn main() -> Result<()> {
         packets_in = packets_in.saturating_add(batch.len() as u64);
         batches = batches.saturating_add(1);
         peak_batch = peak_batch.max(batch.len());
-        for response in selected.engine.process_batch(&batch)?.into_iter().flatten() {
+        selected.engine.process_batch_into(&batch, &mut responses)?;
+        for response in responses.iter().flatten() {
             let sent = device
                 .send(response.as_bytes())
                 .context("failed to inject engine response into TUN")?;

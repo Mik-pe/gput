@@ -30,19 +30,19 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = BackendChoice::Both)]
     backend: BackendChoice,
 
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 32_768)]
     flows: usize,
 
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 1000)]
     requests_per_flow: usize,
 
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 20)]
     warmup_requests_per_flow: usize,
 
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 32_768)]
     batch_size: usize,
 
-    #[arg(long, default_value_t = 16_384)]
+    #[arg(long, default_value_t = 65_536)]
     flow_capacity: usize,
 
     #[arg(long, default_value_t = 64)]
@@ -166,9 +166,10 @@ fn run_benchmark(
 ) -> Result<BenchResult> {
     let mut flows = synthetic_flows(settings.flows, settings.listen_port)?;
     let handshake = establish_flows(engine, &mut flows)?;
+    let mut responses = Vec::with_capacity(settings.flows);
 
     for _ in 0..settings.warmup_requests_per_flow {
-        run_http_round(engine, &mut flows)?;
+        run_http_round(engine, &mut flows, &mut responses)?;
     }
 
     let metrics_before = engine.metrics();
@@ -177,7 +178,7 @@ fn run_benchmark(
     let mut round_latencies = Vec::with_capacity(settings.requests_per_flow);
     let mut response_bytes = 0_u64;
     for _ in 0..settings.requests_per_flow {
-        let round = run_http_round(engine, &mut flows)?;
+        let round = run_http_round(engine, &mut flows, &mut responses)?;
         engine_elapsed += round.elapsed;
         round_latencies.push(duration_nanos(round.elapsed));
         response_bytes = response_bytes.saturating_add(round.response_bytes);
@@ -281,21 +282,27 @@ struct RoundResult {
     response_bytes: u64,
 }
 
-fn run_http_round(engine: &impl PacketEngine, flows: &mut [FlowCursor]) -> Result<RoundResult> {
+fn run_http_round(
+    engine: &impl PacketEngine,
+    flows: &mut [FlowCursor],
+    responses: &mut Vec<Option<RawPacket>>,
+) -> Result<RoundResult> {
     let requests = flows
         .iter()
         .map(|flow| client_packet(*flow, TCP_ACK | TCP_PSH, DEFAULT_REQUEST))
         .collect::<Result<Vec<_>>>()?;
     let started = Instant::now();
-    let responses = engine.process_batch(&requests)?;
+    engine.process_batch_into(&requests, responses)?;
     let elapsed = started.elapsed();
     ensure!(responses.len() == flows.len(), "HTTP output count mismatch");
 
     let mut response_bytes = 0_u64;
-    for (flow, response) in flows.iter_mut().zip(responses) {
-        let response = response.context("HTTP request produced no packet")?;
-        validate_ipv4_tcp_checksums(&response)?;
-        let tcp = parse_ipv4_tcp(&response).context("HTTP response did not parse")?;
+    for (flow, response) in flows.iter_mut().zip(responses.iter()) {
+        let response = response
+            .as_ref()
+            .context("HTTP request produced no packet")?;
+        validate_ipv4_tcp_checksums(response)?;
+        let tcp = parse_ipv4_tcp(response).context("HTTP response did not parse")?;
         ensure!(
             tcp.seq == flow.server_next,
             "HTTP response sequence drifted"
@@ -406,6 +413,18 @@ fn print_human(results: &[BenchResult]) {
                 .map(|adapter| format!(" | adapter: {adapter}"))
                 .unwrap_or_default(),
         );
+        if result.metrics.readback_nanos > 0 {
+            let packets = result.metrics.packets.max(1) as f64;
+            println!(
+                "  profile ns/packet: schedule {:.1} | pack {:.1} | upload {:.1} | submit {:.1} | GPU+readback {:.1} | decode {:.1}",
+                result.metrics.schedule_nanos as f64 / packets,
+                result.metrics.pack_nanos as f64 / packets,
+                result.metrics.upload_nanos as f64 / packets,
+                result.metrics.submit_nanos as f64 / packets,
+                result.metrics.readback_nanos as f64 / packets,
+                result.metrics.decode_nanos as f64 / packets,
+            );
+        }
     }
     if let (Some(cpu), Some(gpu)) = (
         results.iter().find(|result| result.backend == "cpu-packet"),
@@ -442,7 +461,13 @@ fn print_json(results: &[BenchResult]) {
                 "\"p50_round_nanos\":{},",
                 "\"p99_round_nanos\":{},",
                 "\"dispatches\":{},",
-                "\"packets\":{}",
+                "\"packets\":{},",
+                "\"schedule_nanos\":{},",
+                "\"pack_nanos\":{},",
+                "\"upload_nanos\":{},",
+                "\"submit_nanos\":{},",
+                "\"readback_nanos\":{},",
+                "\"decode_nanos\":{}",
                 "}}"
             ),
             result.backend,
@@ -464,6 +489,12 @@ fn print_json(results: &[BenchResult]) {
             result.percentile_nanos(99),
             result.metrics.dispatches,
             result.metrics.packets,
+            result.metrics.schedule_nanos,
+            result.metrics.pack_nanos,
+            result.metrics.upload_nanos,
+            result.metrics.submit_nanos,
+            result.metrics.readback_nanos,
+            result.metrics.decode_nanos,
         );
     }
     println!("]}}");

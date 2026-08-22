@@ -13,10 +13,12 @@ pub use wire::{
 use std::{
     collections::HashSet,
     fmt::Write as _,
+    hash::{BuildHasherDefault, Hasher},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -49,7 +51,8 @@ const PACKET_RESPONSES: [&[u8]; 5] = [
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct PacketMeta {
     len: u32,
-    _padding: [u32; 3],
+    word_offset: u32,
+    _padding: [u32; 2],
 }
 
 #[repr(C)]
@@ -72,7 +75,35 @@ struct PacketScratch {
     pending: Vec<usize>,
     deferred: Vec<usize>,
     wave: Vec<usize>,
-    seen: HashSet<FlowKey>,
+    seen: HashSet<FlowKey, BuildHasherDefault<FlowKeyHasher>>,
+}
+
+struct FlowKeyHasher(u32);
+
+impl Default for FlowKeyHasher {
+    fn default() -> Self {
+        Self(2_166_136_261)
+    }
+}
+
+impl Hasher for FlowKeyHasher {
+    fn finish(&self) -> u64 {
+        u64::from(self.0)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ u32::from(byte)).wrapping_mul(16_777_619);
+        }
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.0 = (self.0 ^ u32::from(value)).wrapping_mul(16_777_619);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0 = (self.0 ^ value).wrapping_mul(16_777_619);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +136,12 @@ impl RawPacket {
 pub struct PacketEngineMetrics {
     pub dispatches: u64,
     pub packets: u64,
+    pub schedule_nanos: u64,
+    pub pack_nanos: u64,
+    pub upload_nanos: u64,
+    pub submit_nanos: u64,
+    pub readback_nanos: u64,
+    pub decode_nanos: u64,
 }
 
 impl PacketEngineMetrics {
@@ -112,13 +149,29 @@ impl PacketEngineMetrics {
         Self {
             dispatches: self.dispatches.saturating_sub(earlier.dispatches),
             packets: self.packets.saturating_sub(earlier.packets),
+            schedule_nanos: self.schedule_nanos.saturating_sub(earlier.schedule_nanos),
+            pack_nanos: self.pack_nanos.saturating_sub(earlier.pack_nanos),
+            upload_nanos: self.upload_nanos.saturating_sub(earlier.upload_nanos),
+            submit_nanos: self.submit_nanos.saturating_sub(earlier.submit_nanos),
+            readback_nanos: self.readback_nanos.saturating_sub(earlier.readback_nanos),
+            decode_nanos: self.decode_nanos.saturating_sub(earlier.decode_nanos),
         }
     }
 }
 
 pub trait PacketEngine {
     fn name(&self) -> &'static str;
-    fn process_batch(&self, packets: &[RawPacket]) -> Result<Vec<Option<RawPacket>>>;
+    fn process_batch_into(
+        &self,
+        packets: &[RawPacket],
+        output: &mut Vec<Option<RawPacket>>,
+    ) -> Result<()>;
+
+    fn process_batch(&self, packets: &[RawPacket]) -> Result<Vec<Option<RawPacket>>> {
+        let mut output = Vec::new();
+        self.process_batch_into(packets, &mut output)?;
+        Ok(output)
+    }
 
     fn metrics(&self) -> PacketEngineMetrics {
         PacketEngineMetrics::default()
@@ -158,10 +211,17 @@ pub struct GpuPacketEngine {
     readback: wgpu::Buffer,
     params: wgpu::Buffer,
     config: PacketEngineConfig,
+    input_word_capacity: usize,
     output_stride_words: usize,
     adapter_name: String,
     dispatches: AtomicU64,
     packets: AtomicU64,
+    schedule_nanos: AtomicU64,
+    pack_nanos: AtomicU64,
+    upload_nanos: AtomicU64,
+    submit_nanos: AtomicU64,
+    readback_nanos: AtomicU64,
+    decode_nanos: AtomicU64,
     scratch: Mutex<PacketScratch>,
 }
 
@@ -200,13 +260,15 @@ impl GpuPacketEngine {
         let mut required_limits = wgpu::Limits::downlevel_defaults();
         required_limits.max_storage_buffers_per_shader_stage =
             REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE;
+        let max_storage_binding_bytes = required_limits.max_storage_buffer_binding_size as usize;
+        let max_buffer_bytes = required_limits.max_buffer_size as usize;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gput-packet-device"),
                 required_features: wgpu::Features::empty(),
                 required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
             .await
@@ -222,11 +284,13 @@ impl GpuPacketEngine {
             .max_batch_size
             .checked_mul(std::mem::size_of::<PacketMeta>())
             .context("packet metadata buffer size overflow")?;
-        let input_words_bytes = config
+        let requested_input_words_bytes = config
             .max_batch_size
             .checked_mul(INPUT_PACKET_WORDS)
             .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
             .context("packet input buffer size overflow")?;
+        let input_words_bytes = requested_input_words_bytes.min(max_storage_binding_bytes);
+        let input_word_capacity = input_words_bytes / std::mem::size_of::<u32>();
         let output_stride_words = max_response_packet_bytes().div_ceil(std::mem::size_of::<u32>());
         let output_words_bytes = config
             .max_batch_size
@@ -243,6 +307,22 @@ impl GpuPacketEngine {
         let flow_bytes = flow_words
             .checked_mul(std::mem::size_of::<u32>())
             .context("flow buffer size overflow")?;
+        ensure!(
+            packet_meta_bytes <= max_storage_binding_bytes,
+            "packet metadata needs {packet_meta_bytes} bytes, above the adapter binding limit of {max_storage_binding_bytes}"
+        );
+        ensure!(
+            output_words_bytes <= max_storage_binding_bytes,
+            "packet output needs {output_words_bytes} bytes, above the adapter binding limit of {max_storage_binding_bytes}"
+        );
+        ensure!(
+            flow_bytes <= max_storage_binding_bytes,
+            "flow state needs {flow_bytes} bytes, above the adapter binding limit of {max_storage_binding_bytes}"
+        );
+        ensure!(
+            readback_bytes <= max_buffer_bytes,
+            "packet readback needs {readback_bytes} bytes, above the adapter buffer limit of {max_buffer_bytes}"
+        );
 
         let input_meta = storage_buffer(&device, "packet input metadata", packet_meta_bytes, false);
         let input_words = storage_buffer(&device, "packet input words", input_words_bytes, false);
@@ -315,7 +395,7 @@ impl GpuPacketEngine {
             flow_capacity = config.flow_capacity,
             flow_probe_limit = config.flow_probe_limit,
             listen_port = config.listen_port,
-            input_slot_bytes = INPUT_PACKET_WORDS * std::mem::size_of::<u32>(),
+            input_buffer_bytes = input_words_bytes,
             output_slot_bytes = output_stride_words * std::mem::size_of::<u32>(),
             "using collision-safe GPU-native packet engine"
         );
@@ -334,10 +414,17 @@ impl GpuPacketEngine {
             readback,
             params,
             config,
+            input_word_capacity,
             output_stride_words,
             adapter_name: adapter_info.name,
             dispatches: AtomicU64::new(0),
             packets: AtomicU64::new(0),
+            schedule_nanos: AtomicU64::new(0),
+            pack_nanos: AtomicU64::new(0),
+            upload_nanos: AtomicU64::new(0),
+            submit_nanos: AtomicU64::new(0),
+            readback_nanos: AtomicU64::new(0),
+            decode_nanos: AtomicU64::new(0),
             scratch: Mutex::new(PacketScratch::default()),
         })
     }
@@ -348,19 +435,16 @@ impl GpuPacketEngine {
         wave: &[usize],
         metadata: &mut Vec<PacketMeta>,
         words: &mut Vec<u32>,
-    ) -> Result<Vec<Option<RawPacket>>> {
+        output: &mut [Option<RawPacket>],
+    ) -> Result<()> {
         if wave.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let packet_count = wave.len();
-        metadata.resize(packet_count, PacketMeta::zeroed());
-        words.resize(packet_count * INPUT_PACKET_WORDS, 0);
-        for (packet_index, source_index) in wave.iter().copied().enumerate() {
-            let packet = &packets[source_index];
-            metadata[packet_index].len = packet.bytes.len() as u32;
-            let base = packet_index * INPUT_PACKET_WORDS;
-            pack_packet(&packet.bytes, &mut words[base..base + INPUT_PACKET_WORDS]);
-        }
+        let pack_started = Instant::now();
+        pack_wave_inputs(packets, wave, metadata, words)?;
+        self.pack_nanos
+            .fetch_add(duration_nanos(pack_started.elapsed()), Ordering::Relaxed);
 
         let params = EngineParams {
             packet_count: packet_count as u32,
@@ -371,17 +455,21 @@ impl GpuPacketEngine {
             flow_probe_limit: self.config.flow_probe_limit as u32,
             _padding: [0; 2],
         };
+        let upload_started = Instant::now();
         self.queue
             .write_buffer(&self.input_meta, 0, bytemuck::cast_slice(metadata));
         self.queue
             .write_buffer(&self.input_words, 0, bytemuck::cast_slice(words));
         self.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
+        self.upload_nanos
+            .fetch_add(duration_nanos(upload_started.elapsed()), Ordering::Relaxed);
 
         let meta_copy_bytes = (packet_count * std::mem::size_of::<PacketMeta>()) as u64;
         let word_copy_bytes =
             (packet_count * self.output_stride_words * std::mem::size_of::<u32>()) as u64;
         let readback_copy_bytes = meta_copy_bytes + word_copy_bytes;
+        let submit_started = Instant::now();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -405,18 +493,24 @@ impl GpuPacketEngine {
             word_copy_bytes,
         );
         self.queue.submit(Some(encoder.finish()));
+        self.submit_nanos
+            .fetch_add(duration_nanos(submit_started.elapsed()), Ordering::Relaxed);
 
+        let readback_started = Instant::now();
         let readback = map_read(&self.device, &self.readback, readback_copy_bytes)?;
-        let output = {
+        self.readback_nanos.fetch_add(
+            duration_nanos(readback_started.elapsed()),
+            Ordering::Relaxed,
+        );
+        let decode_started = Instant::now();
+        let decode_result = {
             let (meta_bytes, word_bytes) = readback.split_at(meta_copy_bytes as usize);
             let output_meta: &[PacketMeta] = bytemuck::cast_slice(meta_bytes);
             let output_words: &[u32] = bytemuck::cast_slice(word_bytes);
-            let mut output = Vec::with_capacity(packet_count);
-
-            for (index, meta) in output_meta.iter().enumerate() {
+            for (index, (meta, &source_index)) in output_meta.iter().zip(wave.iter()).enumerate() {
                 let len = meta.len as usize;
                 if len == 0 {
-                    output.push(None);
+                    output[source_index] = None;
                     continue;
                 }
                 ensure!(
@@ -424,20 +518,23 @@ impl GpuPacketEngine {
                     "GPU produced packet of {len} bytes outside the tight response slot"
                 );
                 let base = index * self.output_stride_words;
-                output.push(Some(RawPacket::new(unpack_packet(
+                assign_packet_words(
+                    &mut output[source_index],
                     &output_words[base..base + self.output_stride_words],
                     len,
-                ))?));
+                )?;
             }
-            output
+            Ok::<_, anyhow::Error>(())
         };
 
         drop(readback);
         self.readback.unmap();
+        self.decode_nanos
+            .fetch_add(duration_nanos(decode_started.elapsed()), Ordering::Relaxed);
         self.dispatches.fetch_add(1, Ordering::Relaxed);
         self.packets
             .fetch_add(packet_count as u64, Ordering::Relaxed);
-        Ok(output)
+        decode_result
     }
 }
 
@@ -446,25 +543,33 @@ impl PacketEngine for GpuPacketEngine {
         "gpu-packet"
     }
 
-    fn process_batch(&self, packets: &[RawPacket]) -> Result<Vec<Option<RawPacket>>> {
+    fn process_batch_into(
+        &self,
+        packets: &[RawPacket],
+        output: &mut Vec<Option<RawPacket>>,
+    ) -> Result<()> {
         if packets.is_empty() {
-            return Ok(Vec::new());
+            output.clear();
+            return Ok(());
         }
-        let mut output = vec![None; packets.len()];
+        let schedule_started = Instant::now();
+        let mut schedule_elapsed = Duration::ZERO;
+        output.truncate(packets.len());
+        output.resize_with(packets.len(), || None);
         let mut scratch = self
             .scratch
             .lock()
             .map_err(|_| anyhow::anyhow!("GPU packet scratch buffer poisoned"))?;
         scratch.keys.clear();
-        scratch.keys.extend(
-            packets
-                .iter()
-                .map(|packet| parse_ipv4_tcp(packet).map(|tcp| tcp.key)),
-        );
+        scratch
+            .keys
+            .extend(packets.iter().map(wire::scheduling_flow_key));
         scratch.pending.clear();
         scratch.pending.extend(0..packets.len());
+        schedule_elapsed += schedule_started.elapsed();
 
         while !scratch.pending.is_empty() {
+            let fill_started = Instant::now();
             {
                 let PacketScratch {
                     keys,
@@ -475,41 +580,50 @@ impl PacketEngine for GpuPacketEngine {
                     ..
                 } = &mut *scratch;
                 fill_next_wave(
+                    packets,
                     keys,
                     pending,
-                    self.config.max_batch_size,
+                    (self.config.max_batch_size, self.input_word_capacity),
                     seen,
                     wave,
                     deferred,
                 );
             }
+            schedule_elapsed += fill_started.elapsed();
 
-            let wave_output = {
+            {
                 let PacketScratch {
                     metadata,
                     words,
                     wave,
                     ..
                 } = &mut *scratch;
-                self.dispatch_wave(packets, wave, metadata, words)?
-            };
-            for (&index, packet) in scratch.wave.iter().zip(wave_output) {
-                output[index] = packet;
+                self.dispatch_wave(packets, wave, metadata, words, output)?;
             }
+            let scatter_started = Instant::now();
             {
                 let PacketScratch {
                     pending, deferred, ..
                 } = &mut *scratch;
                 std::mem::swap(pending, deferred);
             }
+            schedule_elapsed += scatter_started.elapsed();
         }
-        Ok(output)
+        self.schedule_nanos
+            .fetch_add(duration_nanos(schedule_elapsed), Ordering::Relaxed);
+        Ok(())
     }
 
     fn metrics(&self) -> PacketEngineMetrics {
         PacketEngineMetrics {
             dispatches: self.dispatches.load(Ordering::Relaxed),
             packets: self.packets.load(Ordering::Relaxed),
+            schedule_nanos: self.schedule_nanos.load(Ordering::Relaxed),
+            pack_nanos: self.pack_nanos.load(Ordering::Relaxed),
+            upload_nanos: self.upload_nanos.load(Ordering::Relaxed),
+            submit_nanos: self.submit_nanos.load(Ordering::Relaxed),
+            readback_nanos: self.readback_nanos.load(Ordering::Relaxed),
+            decode_nanos: self.decode_nanos.load(Ordering::Relaxed),
         }
     }
 }
@@ -592,19 +706,26 @@ fn max_response_packet_bytes() -> usize {
 }
 
 fn fill_next_wave(
+    packets: &[RawPacket],
     keys: &[Option<FlowKey>],
     pending: &[usize],
-    max_batch_size: usize,
-    seen: &mut HashSet<FlowKey>,
+    limits: (usize, usize),
+    seen: &mut HashSet<FlowKey, BuildHasherDefault<FlowKeyHasher>>,
     wave: &mut Vec<usize>,
     deferred: &mut Vec<usize>,
 ) {
+    let (max_batch_size, max_input_words) = limits;
     seen.clear();
     wave.clear();
     deferred.clear();
 
+    let mut input_words = 0_usize;
     for &index in pending {
-        if wave.len() == max_batch_size {
+        let packet_words = packets[index]
+            .bytes
+            .len()
+            .div_ceil(std::mem::size_of::<u32>());
+        if wave.len() == max_batch_size || input_words + packet_words > max_input_words {
             deferred.push(index);
             continue;
         }
@@ -615,6 +736,7 @@ fn fill_next_wave(
             continue;
         }
         wave.push(index);
+        input_words += packet_words;
     }
 }
 
@@ -638,7 +760,6 @@ fn packet_shader_source() -> Result<String> {
 
     let words = pack_bytes(&response_bytes);
     let mut source = String::new();
-    writeln!(source, "const FLOW_WORDS: u32 = {FLOW_WORDS}u;")?;
     writeln!(
         source,
         "const RESPONSE_COUNT: u32 = {}u;",
@@ -777,9 +898,58 @@ fn pack_packet(bytes: &[u8], words: &mut [u32]) {
     destination[..bytes.len()].copy_from_slice(bytes);
 }
 
+fn pack_wave_inputs(
+    packets: &[RawPacket],
+    wave: &[usize],
+    metadata: &mut Vec<PacketMeta>,
+    words: &mut Vec<u32>,
+) -> Result<()> {
+    metadata.clear();
+    words.clear();
+
+    for &source_index in wave {
+        let packet = &packets[source_index];
+        let word_offset = words.len();
+        let packet_words = packet.bytes.len().div_ceil(std::mem::size_of::<u32>());
+        words.resize(word_offset + packet_words, 0);
+        words[word_offset..].fill(0);
+        pack_packet(
+            &packet.bytes,
+            &mut words[word_offset..word_offset + packet_words],
+        );
+        metadata.push(PacketMeta {
+            len: u32::try_from(packet.bytes.len()).context("packet length does not fit u32")?,
+            word_offset: u32::try_from(word_offset)
+                .context("packet word offset does not fit u32")?,
+            _padding: [0; 2],
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn unpack_packet(words: &[u32], len: usize) -> Vec<u8> {
     let bytes: &[u8] = bytemuck::cast_slice(words);
     bytes[..len].to_vec()
+}
+
+fn assign_packet_words(slot: &mut Option<RawPacket>, words: &[u32], len: usize) -> Result<()> {
+    ensure!(
+        len > 0 && len <= MAX_RAW_PACKET_BYTES,
+        "packet output length {len} is outside the raw packet bounds"
+    );
+    let source: &[u8] = bytemuck::cast_slice(words);
+    if let Some(packet) = slot {
+        packet.bytes.clear();
+        packet.bytes.extend_from_slice(&source[..len]);
+    } else {
+        *slot = Some(RawPacket::new(source[..len].to_vec())?);
+    }
+    Ok(())
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -792,6 +962,24 @@ mod tests {
         let mut words = [0_u32; INPUT_PACKET_WORDS];
         pack_packet(bytes, &mut words);
         assert_eq!(unpack_packet(&words, bytes.len()), bytes);
+    }
+
+    #[test]
+    fn packet_wave_packs_only_live_words_and_records_offsets() {
+        let packets = vec![
+            RawPacket::new(b"abc".to_vec()).expect("first packet"),
+            RawPacket::new(b"12345".to_vec()).expect("second packet"),
+        ];
+        let mut metadata = Vec::new();
+        let mut words = Vec::new();
+
+        pack_wave_inputs(&packets, &[0, 1], &mut metadata, &mut words).expect("packet wave packs");
+
+        assert_eq!(metadata[0].word_offset, 0);
+        assert_eq!(metadata[1].word_offset, 1);
+        assert_eq!(words.len(), 3);
+        assert_eq!(&bytemuck::cast_slice::<u32, u8>(&words)[..3], b"abc");
+        assert_eq!(&bytemuck::cast_slice::<u32, u8>(&words)[4..9], b"12345");
     }
 
     #[test]
@@ -871,16 +1059,57 @@ mod tests {
             .iter()
             .map(|packet| parse_ipv4_tcp(packet).map(|tcp| tcp.key))
             .collect::<Vec<_>>();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut pending = vec![0, 1, 2];
         let mut deferred = Vec::new();
         let mut wave = Vec::new();
 
-        fill_next_wave(&keys, &pending, 8, &mut seen, &mut wave, &mut deferred);
+        fill_next_wave(
+            &packets,
+            &keys,
+            &pending,
+            (8, usize::MAX),
+            &mut seen,
+            &mut wave,
+            &mut deferred,
+        );
         assert_eq!(wave, vec![0, 2]);
         std::mem::swap(&mut pending, &mut deferred);
-        fill_next_wave(&keys, &pending, 8, &mut seen, &mut wave, &mut deferred);
+        fill_next_wave(
+            &packets,
+            &keys,
+            &pending,
+            (8, usize::MAX),
+            &mut seen,
+            &mut wave,
+            &mut deferred,
+        );
         assert_eq!(wave, vec![1]);
+    }
+
+    #[test]
+    fn scheduler_splits_waves_on_compact_input_capacity() {
+        let packets = vec![
+            RawPacket::new(vec![1; 5]).expect("first packet"),
+            RawPacket::new(vec![2; 8]).expect("second packet"),
+        ];
+        let keys = vec![None, None];
+        let mut seen = HashSet::default();
+        let mut deferred = Vec::new();
+        let mut wave = Vec::new();
+
+        fill_next_wave(
+            &packets,
+            &keys,
+            &[0, 1],
+            (2, 3),
+            &mut seen,
+            &mut wave,
+            &mut deferred,
+        );
+
+        assert_eq!(wave, vec![0]);
+        assert_eq!(deferred, vec![1]);
     }
 
     #[test]
