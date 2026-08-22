@@ -639,7 +639,7 @@ fn write_response(
     writer_finish(writer, status);
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(128)
 fn process_requests(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let request_index = global_id.x;
     if (request_index >= params.request_count) {

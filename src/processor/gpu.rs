@@ -21,7 +21,7 @@ use crate::{
 };
 
 const SHADER_BODY: &str = include_str!("http.wgsl");
-const WORKGROUP_SIZE: u32 = 64;
+const WORKGROUP_SIZE: u32 = 128;
 const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 7;
 
 #[repr(C)]
@@ -69,7 +69,8 @@ pub struct GpuProcessor {
     _string_meta_buffer: wgpu::Buffer,
     _string_words_buffer: wgpu::Buffer,
     _router_words_buffer: wgpu::Buffer,
-    readback_buffer: wgpu::Buffer,
+    readback_buffer: Option<wgpu::Buffer>,
+    direct_output_mapping: bool,
     router_layout: GpuRouterLayout,
     max_batch_size: usize,
     max_request_bytes: usize,
@@ -149,6 +150,10 @@ impl GpuProcessor {
         .context("no suitable GPU adapter was found")?;
 
         let adapter_info = adapter.get_info();
+        let direct_output_mapping = adapter_info.device_type == wgpu::DeviceType::IntegratedGpu
+            && adapter
+                .features()
+                .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
         let downlevel_capabilities = adapter.get_downlevel_capabilities();
         if !downlevel_capabilities
             .flags
@@ -166,7 +171,11 @@ impl GpuProcessor {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gput-device"),
-            required_features: wgpu::Features::empty(),
+            required_features: if direct_output_mapping {
+                wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+            } else {
+                wgpu::Features::empty()
+            },
             required_limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -265,18 +274,17 @@ impl GpuProcessor {
             input_bytes,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
+        let mut output_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+        if direct_output_mapping {
+            output_usage |= wgpu::BufferUsages::MAP_READ;
+        }
         let response_meta_buffer = create_buffer(
             &device,
             "gput-response-meta",
             response_meta_bytes,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            output_usage,
         );
-        let output_buffer = create_buffer(
-            &device,
-            "gput-output",
-            output_bytes,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
+        let output_buffer = create_buffer(&device, "gput-output", output_bytes, output_usage);
         let string_meta_buffer = create_buffer(
             &device,
             "gput-string-meta",
@@ -295,12 +303,14 @@ impl GpuProcessor {
             router_words_bytes,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
-        let readback_buffer = create_buffer(
-            &device,
-            "gput-combined-readback",
-            readback_bytes,
-            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        );
+        let readback_buffer = (!direct_output_mapping).then(|| {
+            create_buffer(
+                &device,
+                "gput-combined-readback",
+                readback_bytes,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            )
+        });
 
         queue.write_buffer(
             &string_meta_buffer,
@@ -371,6 +381,7 @@ impl GpuProcessor {
             router_words = router.router_words().len(),
             shader_strings = shader_assets.metadata.len(),
             shader_string_bytes = shader_assets.byte_len,
+            direct_output_mapping,
             "using GPU compute processor"
         );
 
@@ -389,6 +400,7 @@ impl GpuProcessor {
             _string_words_buffer: string_words_buffer,
             _router_words_buffer: router_words_buffer,
             readback_buffer,
+            direct_output_mapping,
             router_layout,
             max_batch_size: limits.max_batch_size,
             max_request_bytes: limits.max_request_bytes,
@@ -471,20 +483,22 @@ impl GpuProcessor {
             compute_pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(
-            &self.response_meta_buffer,
-            0,
-            &self.readback_buffer,
-            0,
-            response_meta_copy_bytes,
-        );
-        encoder.copy_buffer_to_buffer(
-            &self.output_buffer,
-            0,
-            &self.readback_buffer,
-            response_meta_copy_bytes,
-            output_copy_bytes,
-        );
+        if let Some(readback_buffer) = &self.readback_buffer {
+            encoder.copy_buffer_to_buffer(
+                &self.response_meta_buffer,
+                0,
+                readback_buffer,
+                0,
+                response_meta_copy_bytes,
+            );
+            encoder.copy_buffer_to_buffer(
+                &self.output_buffer,
+                0,
+                readback_buffer,
+                response_meta_copy_bytes,
+                output_copy_bytes,
+            );
+        }
         self.queue.submit([encoder.finish()]);
 
         self.read_responses(request_count, response_meta_copy_bytes, output_copy_bytes)
@@ -496,10 +510,22 @@ impl GpuProcessor {
         response_meta_copy_bytes: u64,
         output_copy_bytes: u64,
     ) -> Result<Vec<Vec<u8>>> {
+        if self.direct_output_mapping {
+            return self.read_direct_responses(
+                request_count,
+                response_meta_copy_bytes,
+                output_copy_bytes,
+            );
+        }
+
         let readback_bytes = response_meta_copy_bytes
             .checked_add(output_copy_bytes)
             .context("HTTP readback copy size overflow")?;
-        let slice = self.readback_buffer.slice(0..readback_bytes);
+        let readback_buffer = self
+            .readback_buffer
+            .as_ref()
+            .context("HTTP readback buffer is unavailable")?;
+        let slice = readback_buffer.slice(0..readback_bytes);
         let (sender, receiver) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
@@ -514,43 +540,111 @@ impl GpuProcessor {
         let data = slice
             .get_mapped_range()
             .context("reading mapped HTTP responses failed")?;
-        let decode_result = (|| -> Result<Vec<Vec<u8>>> {
-            let (meta_data, output_data) = data.split_at(response_meta_copy_bytes as usize);
-            let response_stride_bytes = self.response_stride_words * size_of::<u32>();
-            let mut responses = Vec::with_capacity(request_count);
-
-            for request_index in 0..request_count {
-                let meta_start = request_index * size_of::<ResponseMeta>();
-                let meta_end = meta_start + size_of::<ResponseMeta>();
-                let meta: ResponseMeta =
-                    bytemuck::pod_read_unaligned(&meta_data[meta_start..meta_end]);
-
-                if meta.flags != 0 {
-                    bail!(
-                        "shader failed request {request_index} with status {} and flags {}",
-                        meta.status,
-                        meta.flags
-                    );
-                }
-
-                let output_len = usize::try_from(meta.output_len)
-                    .context("shader response length does not fit usize")?;
-                if output_len == 0 || output_len > response_stride_bytes {
-                    bail!(
-                        "shader returned invalid response length {output_len} for request {request_index}"
-                    );
-                }
-
-                let output_start = request_index * response_stride_bytes;
-                responses.push(output_data[output_start..output_start + output_len].to_vec());
-            }
-
-            Ok(responses)
-        })();
+        let (meta_data, output_data) = data.split_at(response_meta_copy_bytes as usize);
+        let decode_result = self.decode_responses(request_count, meta_data, output_data);
 
         drop(data);
-        self.readback_buffer.unmap();
+        readback_buffer.unmap();
         decode_result
+    }
+
+    fn read_direct_responses(
+        &self,
+        request_count: usize,
+        response_meta_bytes: u64,
+        output_bytes: u64,
+    ) -> Result<Vec<Vec<u8>>> {
+        let meta_slice = self.response_meta_buffer.slice(0..response_meta_bytes);
+        let output_slice = self.output_buffer.slice(0..output_bytes);
+        let (meta_sender, meta_receiver) = mpsc::sync_channel(1);
+        let (output_sender, output_receiver) = mpsc::sync_channel(1);
+        meta_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = meta_sender.send(result);
+        });
+        output_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = output_sender.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("waiting for directly mapped GPU batch failed")?;
+        let meta_map_result = meta_receiver
+            .recv()
+            .context("direct response metadata callback disappeared")?;
+        let output_map_result = output_receiver
+            .recv()
+            .context("direct response output callback disappeared")?;
+
+        if let Err(error) = meta_map_result {
+            if output_map_result.is_ok() {
+                self.output_buffer.unmap();
+            }
+            return Err(anyhow!("mapping direct response metadata failed: {error}"));
+        }
+        if let Err(error) = output_map_result {
+            self.response_meta_buffer.unmap();
+            return Err(anyhow!("mapping direct response output failed: {error}"));
+        }
+
+        let meta_data = match meta_slice.get_mapped_range() {
+            Ok(data) => data,
+            Err(error) => {
+                self.output_buffer.unmap();
+                self.response_meta_buffer.unmap();
+                return Err(error).context("reading direct response metadata failed");
+            }
+        };
+        let output_data = match output_slice.get_mapped_range() {
+            Ok(data) => data,
+            Err(error) => {
+                drop(meta_data);
+                self.output_buffer.unmap();
+                self.response_meta_buffer.unmap();
+                return Err(error).context("reading direct response output failed");
+            }
+        };
+        let result = self.decode_responses(request_count, &meta_data, &output_data);
+        drop(output_data);
+        drop(meta_data);
+        self.output_buffer.unmap();
+        self.response_meta_buffer.unmap();
+        result
+    }
+
+    fn decode_responses(
+        &self,
+        request_count: usize,
+        meta_data: &[u8],
+        output_data: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        let response_stride_bytes = self.response_stride_words * size_of::<u32>();
+        let mut responses = Vec::with_capacity(request_count);
+
+        for request_index in 0..request_count {
+            let meta_start = request_index * size_of::<ResponseMeta>();
+            let meta_end = meta_start + size_of::<ResponseMeta>();
+            let meta: ResponseMeta = bytemuck::pod_read_unaligned(&meta_data[meta_start..meta_end]);
+
+            if meta.flags != 0 {
+                bail!(
+                    "shader failed request {request_index} with status {} and flags {}",
+                    meta.status,
+                    meta.flags
+                );
+            }
+
+            let output_len = usize::try_from(meta.output_len)
+                .context("shader response length does not fit usize")?;
+            if output_len == 0 || output_len > response_stride_bytes {
+                bail!(
+                    "shader returned invalid response length {output_len} for request {request_index}"
+                );
+            }
+
+            let output_start = request_index * response_stride_bytes;
+            responses.push(output_data[output_start..output_start + output_len].to_vec());
+        }
+
+        Ok(responses)
     }
 }
 
