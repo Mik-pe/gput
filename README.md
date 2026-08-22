@@ -233,6 +233,7 @@ See [the proof contract](docs/PROOF.md) and [benchmark rules](BENCHMARKING.md).
 - atomic flow-slot claims with ordinary per-flow sequence fields once ownership is established
 - ordered dispatch waves for packets belonging to the same flow
 - batched TUN ingress with packet/dispatch telemetry
+- pooled TUN receive packets and borrowed mapped-output delivery, avoiding two host-side allocation/copy detours
 - CPU packet reference and identical-workload packet benchmark
 - Linux TUN-to-GPU `curl` coverage and macOS build coverage
 

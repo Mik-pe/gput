@@ -137,6 +137,22 @@ impl RawPacket {
         Ok(Self { bytes })
     }
 
+    pub fn copy_from_slice(bytes: &[u8]) -> Result<Self> {
+        Self::new(bytes.to_vec())
+    }
+
+    pub fn replace_from_slice(&mut self, bytes: &[u8]) -> Result<()> {
+        ensure!(!bytes.is_empty(), "packet must not be empty");
+        ensure!(
+            bytes.len() <= MAX_RAW_PACKET_BYTES,
+            "packet is {} bytes; maximum is {MAX_RAW_PACKET_BYTES}",
+            bytes.len()
+        );
+        self.bytes.clear();
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -173,6 +189,24 @@ impl PacketEngineMetrics {
     }
 }
 
+/// Receives packet bytes while they are still owned by the engine.
+///
+/// The slice is valid only for the duration of `packet`. Transports can use
+/// this to send mapped GPU output without first building an intermediate
+/// `RawPacket` for every response.
+pub trait PacketSink {
+    fn packet(&mut self, source_index: usize, packet: Option<&[u8]>) -> Result<()>;
+}
+
+impl<F> PacketSink for F
+where
+    F: FnMut(usize, Option<&[u8]>) -> Result<()>,
+{
+    fn packet(&mut self, source_index: usize, packet: Option<&[u8]>) -> Result<()> {
+        self(source_index, packet)
+    }
+}
+
 pub trait PacketEngine {
     fn name(&self) -> &'static str;
     fn process_batch_into(
@@ -185,6 +219,15 @@ pub trait PacketEngine {
         let mut output = Vec::new();
         self.process_batch_into(packets, &mut output)?;
         Ok(output)
+    }
+
+    fn process_batch_to(&self, packets: &[RawPacket], sink: &mut dyn PacketSink) -> Result<()> {
+        let mut output = Vec::new();
+        self.process_batch_into(packets, &mut output)?;
+        for (source_index, packet) in output.iter().enumerate() {
+            sink.packet(source_index, packet.as_ref().map(RawPacket::as_bytes))?;
+        }
+        Ok(())
     }
 
     fn metrics(&self) -> PacketEngineMetrics {
@@ -463,7 +506,7 @@ impl GpuPacketEngine {
         packets: &[RawPacket],
         wave: &[usize],
         metadata: &mut Vec<PacketMeta>,
-        output: &mut [Option<RawPacket>],
+        sink: &mut dyn PacketSink,
     ) -> Result<()> {
         if wave.is_empty() {
             return Ok(());
@@ -555,12 +598,12 @@ impl GpuPacketEngine {
             let (meta_bytes, word_bytes) = mapped_output.split_at(meta_copy_bytes as usize);
             let output_meta: &[u32] = bytemuck::cast_slice(meta_bytes);
             let output_words: &[u32] = bytemuck::cast_slice(word_bytes);
-            let result = decode_wave_outputs(
+            let result = emit_wave_outputs(
                 output_meta,
                 output_words,
                 wave,
                 self.output_stride_words,
-                output,
+                sink,
             );
             drop(mapped_output);
             self.output.unmap();
@@ -581,12 +624,12 @@ impl GpuPacketEngine {
             let (meta_bytes, word_bytes) = readback.split_at(meta_copy_bytes as usize);
             let output_meta: &[u32] = bytemuck::cast_slice(meta_bytes);
             let output_words: &[u32] = bytemuck::cast_slice(word_bytes);
-            let result = decode_wave_outputs(
+            let result = emit_wave_outputs(
                 output_meta,
                 output_words,
                 wave,
                 self.output_stride_words,
-                output,
+                sink,
             );
             drop(readback);
             self.readback
@@ -614,14 +657,27 @@ impl PacketEngine for GpuPacketEngine {
         packets: &[RawPacket],
         output: &mut Vec<Option<RawPacket>>,
     ) -> Result<()> {
+        output.truncate(packets.len());
+        output.resize_with(packets.len(), || None);
+        let mut sink = |source_index: usize, packet: Option<&[u8]>| -> Result<()> {
+            let slot = &mut output[source_index];
+            match packet {
+                Some(packet) => assign_packet_bytes(slot, packet),
+                None => {
+                    *slot = None;
+                    Ok(())
+                }
+            }
+        };
+        self.process_batch_to(packets, &mut sink)
+    }
+
+    fn process_batch_to(&self, packets: &[RawPacket], sink: &mut dyn PacketSink) -> Result<()> {
         if packets.is_empty() {
-            output.clear();
             return Ok(());
         }
         let schedule_started = Instant::now();
         let mut schedule_elapsed = Duration::ZERO;
-        output.truncate(packets.len());
-        output.resize_with(packets.len(), || None);
         let mut scratch = self
             .scratch
             .lock()
@@ -649,7 +705,7 @@ impl PacketEngine for GpuPacketEngine {
         loop {
             {
                 let PacketScratch { metadata, wave, .. } = &mut *scratch;
-                self.dispatch_wave(packets, wave, metadata, output)?;
+                self.dispatch_wave(packets, wave, metadata, sink)?;
             }
             let next_wave_started = Instant::now();
             {
@@ -1090,41 +1146,41 @@ fn unpack_packet(words: &[u32], len: usize) -> Vec<u8> {
     bytes[..len].to_vec()
 }
 
-fn assign_packet_words(slot: &mut Option<RawPacket>, words: &[u32], len: usize) -> Result<()> {
+fn assign_packet_bytes(slot: &mut Option<RawPacket>, bytes: &[u8]) -> Result<()> {
     ensure!(
-        len > 0 && len <= MAX_RAW_PACKET_BYTES,
-        "packet output length {len} is outside the raw packet bounds"
+        !bytes.is_empty() && bytes.len() <= MAX_RAW_PACKET_BYTES,
+        "packet output length {} is outside the raw packet bounds",
+        bytes.len()
     );
-    let source: &[u8] = bytemuck::cast_slice(words);
     if let Some(packet) = slot {
-        packet.bytes.clear();
-        packet.bytes.extend_from_slice(&source[..len]);
+        packet.replace_from_slice(bytes)?;
     } else {
-        *slot = Some(RawPacket::new(source[..len].to_vec())?);
+        *slot = Some(RawPacket::copy_from_slice(bytes)?);
     }
     Ok(())
 }
 
-fn decode_wave_outputs(
+fn emit_wave_outputs(
     metadata: &[u32],
     words: &[u32],
     wave: &[usize],
     output_stride_words: usize,
-    output: &mut [Option<RawPacket>],
+    sink: &mut dyn PacketSink,
 ) -> Result<()> {
+    let bytes: &[u8] = bytemuck::cast_slice(words);
+    let output_stride_bytes = output_stride_words * std::mem::size_of::<u32>();
     for (index, (&len, &source_index)) in metadata.iter().zip(wave.iter()).enumerate() {
         let len = len as usize;
         if len == 0 {
-            output[source_index] = None;
+            sink.packet(source_index, None)?;
             continue;
         }
         ensure!(
-            len <= output_stride_words * std::mem::size_of::<u32>(),
+            len <= output_stride_bytes,
             "GPU produced packet of {len} bytes outside the tight response slot"
         );
-        let base = index * output_stride_words;
-        let packet_words = &words[base..base + output_stride_words];
-        assign_packet_words(&mut output[source_index], packet_words, len)?;
+        let base = index * output_stride_bytes;
+        sink.packet(source_index, Some(&bytes[base..base + len]))?;
     }
     Ok(())
 }
@@ -1136,6 +1192,15 @@ fn duration_nanos(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_packet_storage_can_be_reused_without_changing_its_contract() {
+        let mut packet = RawPacket::copy_from_slice(b"first").expect("packet builds");
+        packet
+            .replace_from_slice(b"second packet")
+            .expect("packet is replaced");
+        assert_eq!(packet.as_bytes(), b"second packet");
+    }
 
     #[test]
     fn packet_word_packing_round_trips_unaligned_bytes() {

@@ -121,6 +121,8 @@ On integrated GPUs with `MAPPABLE_PRIMARY_BUFFERS`, the output buffers are mappe
 
 Input packets are packed directly into `wgpu` upload staging memory. The engine does not build a second contiguous host `Vec` merely to copy it into the staging allocation one moment later.
 
+Packet outputs also have a borrowed delivery API. A transport may consume each generated packet while the GPU output remains mapped, so `gput-packetd` writes response bytes directly to TUN instead of first copying every response into an intermediate `RawPacket`. Incoming TUN packet allocations are pooled and reused across batches. The kernel boundary still copies; the avoidable furniture-moving inside gput no longer does.
+
 Input metadata carries a compact word offset for each packet. A 70-byte request therefore uploads roughly 70 bytes, not a zero-padded 1,536-byte MTU slot. The buffers retain full MTU capacity without making every small packet pay for it on the queue.
 
 ## Flow-table design

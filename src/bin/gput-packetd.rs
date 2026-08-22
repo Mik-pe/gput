@@ -123,7 +123,7 @@ fn main() -> Result<()> {
 
     let mut buffer = vec![0_u8; usize::from(cli.mtu).max(2048)];
     let mut batch = Vec::with_capacity(cli.batch_capacity);
-    let mut responses = Vec::with_capacity(cli.batch_capacity);
+    let mut spare_packets = Vec::with_capacity(cli.batch_capacity);
     let batch_wait = Duration::from_micros(cli.batch_wait_micros);
     let stats_interval = Duration::from_secs(cli.stats_interval_secs);
     let started = Instant::now();
@@ -132,16 +132,22 @@ fn main() -> Result<()> {
     let mut packets_out = 0_u64;
     let mut batches = 0_u64;
     let mut peak_batch = 0_usize;
+    let mut receive_allocations = 0_u64;
+    let mut receive_reuses = 0_u64;
 
     loop {
-        batch.clear();
+        spare_packets.append(&mut batch);
         let first_len = device
             .recv(&mut buffer)
             .context("failed to read TUN packet")?;
         if first_len == 0 {
             continue;
         }
-        batch.push(RawPacket::new(buffer[..first_len].to_vec())?);
+        if push_received_packet(&mut batch, &mut spare_packets, &buffer[..first_len])? {
+            receive_reuses = receive_reuses.saturating_add(1);
+        } else {
+            receive_allocations = receive_allocations.saturating_add(1);
+        }
 
         let deadline = Instant::now() + batch_wait;
         while batch.len() < cli.batch_capacity {
@@ -152,7 +158,12 @@ fn main() -> Result<()> {
             match device.recv_timeout(&mut buffer, remaining) {
                 Ok(0) => break,
                 Ok(packet_len) => {
-                    batch.push(RawPacket::new(buffer[..packet_len].to_vec())?);
+                    if push_received_packet(&mut batch, &mut spare_packets, &buffer[..packet_len])?
+                    {
+                        receive_reuses = receive_reuses.saturating_add(1);
+                    } else {
+                        receive_allocations = receive_allocations.saturating_add(1);
+                    }
                 }
                 Err(error)
                     if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
@@ -166,18 +177,24 @@ fn main() -> Result<()> {
         packets_in = packets_in.saturating_add(batch.len() as u64);
         batches = batches.saturating_add(1);
         peak_batch = peak_batch.max(batch.len());
-        selected.engine.process_batch_into(&batch, &mut responses)?;
-        for response in responses.iter().flatten() {
+        let mut send_response = |_source_index: usize, response: Option<&[u8]>| -> Result<()> {
+            let Some(response) = response else {
+                return Ok(());
+            };
             let sent = device
-                .send(response.as_bytes())
-                .context("failed to inject engine response into TUN")?;
+                .send(response)
+                .context("failed to inject borrowed engine response into TUN")?;
             ensure!(
-                sent == response.as_bytes().len(),
+                sent == response.len(),
                 "TUN accepted {sent} of {} response bytes",
-                response.as_bytes().len()
+                response.len()
             );
             packets_out = packets_out.saturating_add(1);
-        }
+            Ok(())
+        };
+        selected
+            .engine
+            .process_batch_to(&batch, &mut send_response)?;
 
         if !stats_interval.is_zero() && last_stats.elapsed() >= stats_interval {
             let elapsed = started.elapsed().as_secs_f64();
@@ -185,12 +202,27 @@ fn main() -> Result<()> {
             let average_batch = packets_in as f64 / batches.max(1) as f64;
             let packets_per_dispatch = metrics.packets as f64 / metrics.dispatches.max(1) as f64;
             eprintln!(
-                "gput packet stats: engine={engine_name} in={packets_in} out={packets_out} pps={:.0} batches={batches} avg_batch={average_batch:.2} peak_batch={peak_batch} engine_dispatches={} packets/dispatch={packets_per_dispatch:.2}",
+                "gput packet stats: engine={engine_name} in={packets_in} out={packets_out} pps={:.0} batches={batches} avg_batch={average_batch:.2} peak_batch={peak_batch} rx_allocations={receive_allocations} rx_reuses={receive_reuses} engine_dispatches={} packets/dispatch={packets_per_dispatch:.2}",
                 packets_in as f64 / elapsed.max(f64::EPSILON),
                 metrics.dispatches,
             );
             last_stats = Instant::now();
         }
+    }
+}
+
+fn push_received_packet(
+    batch: &mut Vec<RawPacket>,
+    spare_packets: &mut Vec<RawPacket>,
+    bytes: &[u8],
+) -> Result<bool> {
+    if let Some(mut packet) = spare_packets.pop() {
+        packet.replace_from_slice(bytes)?;
+        batch.push(packet);
+        Ok(true)
+    } else {
+        batch.push(RawPacket::copy_from_slice(bytes)?);
+        Ok(false)
     }
 }
 
