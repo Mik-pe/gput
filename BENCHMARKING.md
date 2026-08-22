@@ -109,7 +109,7 @@ env -u MTL_DEBUG_LAYER -u METAL_DEVICE_WRAPPER_TYPE \
   --json
 ```
 
-| Run | CPU reference req/s | GPU engine req/s |
+| Run | CPU reference req/s | GPU engine req/s before direct staging |
 | ---: | ---: | ---: |
 | 1 | 7,262,403 | 17,130,889 |
 | 2 | 8,142,849 | 17,582,607 |
@@ -121,6 +121,19 @@ env -u MTL_DEBUG_LAYER -u METAL_DEVICE_WRAPPER_TYPE \
 The GPU median is 2.35x the single-threaded CPU semantic reference, represents 34.26 million request-plus-response packets/s, and has 3.82 ms p50 / 4.13 ms p99 batch-round latency. Full-harness GPU throughput, including packet construction and response validation, was 5.37 million requests/s. The slower runs remain visible rather than being polished into the floorboards.
 
 This is a synthetic in-memory raw-packet engine result, not NIC throughput and not a socket HTTP result.
+
+Packing packet bytes directly into `wgpu` upload staging removed a full host-side copy. Five GPU-only follow-up runs with the same 65,536-flow shape and 32,768,000 requests each produced:
+
+| Run | GPU engine req/s |
+| ---: | ---: |
+| 1 | 17,995,502 |
+| 2 | 18,216,351 |
+| 3 | 18,970,775 |
+| 4 | 17,898,723 |
+| 5 | 18,278,389 |
+| **Median** | **18,216,351** |
+
+The follow-up median represents 36.43 million request-plus-response packets/s with 3.49 ms p50 / 5.05 ms p99 batch-round latency. Full-harness median throughput was 4.89 million requests/s. The engine median improved 6.3% over the paired pre-staging GPU result without changing the packet conversation or timed validation boundary.
 
 ## Benchmark the real TUN path
 

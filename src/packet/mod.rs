@@ -67,7 +67,6 @@ struct EngineParams {
 #[derive(Default)]
 struct PacketScratch {
     metadata: Vec<PacketMeta>,
-    words: Vec<u32>,
     keys: Vec<Option<FlowKey>>,
     pending: Vec<usize>,
     deferred: Vec<usize>,
@@ -464,7 +463,6 @@ impl GpuPacketEngine {
         packets: &[RawPacket],
         wave: &[usize],
         metadata: &mut Vec<PacketMeta>,
-        words: &mut Vec<u32>,
         output: &mut [Option<RawPacket>],
     ) -> Result<()> {
         if wave.is_empty() {
@@ -472,7 +470,7 @@ impl GpuPacketEngine {
         }
         let packet_count = wave.len();
         let pack_started = Instant::now();
-        pack_wave_inputs(packets, wave, metadata, words)?;
+        let input_word_count = prepare_wave_metadata(packets, wave, metadata)?;
         self.pack_nanos
             .fetch_add(duration_nanos(pack_started.elapsed()), Ordering::Relaxed);
 
@@ -488,12 +486,28 @@ impl GpuPacketEngine {
         let upload_started = Instant::now();
         self.queue
             .write_buffer(&self.input_meta, 0, bytemuck::cast_slice(metadata));
-        self.queue
-            .write_buffer(&self.input_words, 0, bytemuck::cast_slice(words));
+        let input_word_bytes = input_word_count
+            .checked_mul(std::mem::size_of::<u32>())
+            .context("packet input upload size overflow")?;
+        let upload_size = wgpu::BufferSize::new(input_word_bytes as u64)
+            .context("packet input upload must not be empty")?;
+        let mut word_upload = self
+            .queue
+            .write_buffer_with(&self.input_words, 0, upload_size)
+            .context("failed to allocate packet input upload")?;
+        let upload_before_pack = upload_started.elapsed();
+        let pack_started = Instant::now();
+        pack_wave_bytes(packets, wave, metadata, word_upload.slice(..));
+        self.pack_nanos
+            .fetch_add(duration_nanos(pack_started.elapsed()), Ordering::Relaxed);
+        let upload_resumed = Instant::now();
+        drop(word_upload);
         self.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
-        self.upload_nanos
-            .fetch_add(duration_nanos(upload_started.elapsed()), Ordering::Relaxed);
+        self.upload_nanos.fetch_add(
+            duration_nanos(upload_before_pack + upload_resumed.elapsed()),
+            Ordering::Relaxed,
+        );
 
         let meta_copy_bytes = (packet_count * std::mem::size_of::<u32>()) as u64;
         let word_copy_bytes =
@@ -634,13 +648,8 @@ impl PacketEngine for GpuPacketEngine {
 
         loop {
             {
-                let PacketScratch {
-                    metadata,
-                    words,
-                    wave,
-                    ..
-                } = &mut *scratch;
-                self.dispatch_wave(packets, wave, metadata, words, output)?;
+                let PacketScratch { metadata, wave, .. } = &mut *scratch;
+                self.dispatch_wave(packets, wave, metadata, output)?;
             }
             let next_wave_started = Instant::now();
             {
@@ -1011,36 +1020,67 @@ fn pack_bytes(bytes: &[u8]) -> Vec<u32> {
     words
 }
 
+#[cfg(test)]
 fn pack_packet(bytes: &[u8], words: &mut [u32]) {
     let destination: &mut [u8] = bytemuck::cast_slice_mut(words);
     destination[..bytes.len()].copy_from_slice(bytes);
 }
 
-fn pack_wave_inputs(
+fn prepare_wave_metadata(
     packets: &[RawPacket],
     wave: &[usize],
     metadata: &mut Vec<PacketMeta>,
-    words: &mut Vec<u32>,
-) -> Result<()> {
+) -> Result<usize> {
     metadata.clear();
-    words.clear();
+    let mut word_count = 0_usize;
 
     for &source_index in wave {
         let packet = &packets[source_index];
-        let word_offset = words.len();
+        let word_offset = word_count;
         let packet_words = packet.bytes.len().div_ceil(std::mem::size_of::<u32>());
-        words.resize(word_offset + packet_words, 0);
-        words[word_offset..].fill(0);
-        pack_packet(
-            &packet.bytes,
-            &mut words[word_offset..word_offset + packet_words],
-        );
+        word_count = word_count
+            .checked_add(packet_words)
+            .context("packet input word count overflow")?;
         metadata.push(PacketMeta {
             len: u32::try_from(packet.bytes.len()).context("packet length does not fit u32")?,
             word_offset: u32::try_from(word_offset)
                 .context("packet word offset does not fit u32")?,
         });
     }
+    Ok(word_count)
+}
+
+fn pack_wave_bytes(
+    packets: &[RawPacket],
+    wave: &[usize],
+    metadata: &[PacketMeta],
+    mut destination: wgpu::WriteOnly<'_, [u8]>,
+) {
+    destination.fill(0);
+    for (&source_index, meta) in wave.iter().zip(metadata) {
+        let packet = &packets[source_index];
+        let offset = meta.word_offset as usize * std::mem::size_of::<u32>();
+        destination
+            .slice(offset..offset + packet.bytes.len())
+            .copy_from_slice(&packet.bytes);
+    }
+}
+
+#[cfg(test)]
+fn pack_wave_inputs(
+    packets: &[RawPacket],
+    wave: &[usize],
+    metadata: &mut Vec<PacketMeta>,
+    words: &mut Vec<u32>,
+) -> Result<()> {
+    let word_count = prepare_wave_metadata(packets, wave, metadata)?;
+    words.resize(word_count, 0);
+    pack_wave_bytes(
+        packets,
+        wave,
+        metadata,
+        wgpu::WriteOnly::from_mut(bytemuck::cast_slice_mut(words)),
+    );
     Ok(())
 }
 

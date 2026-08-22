@@ -119,6 +119,8 @@ Different flows run in parallel; the ordering dependency within each flow remain
 
 On integrated GPUs with `MAPPABLE_PRIMARY_BUFFERS`, the output buffers are mapped directly after dispatch. Discrete adapters retain the portable copy-to-readback path, avoiding the performance penalty of host-mappable primary memory where CPU and GPU do not share RAM.
 
+Input packets are packed directly into `wgpu` upload staging memory. The engine does not build a second contiguous host `Vec` merely to copy it into the staging allocation one moment later.
+
 Input metadata carries a compact word offset for each packet. A 70-byte request therefore uploads roughly 70 bytes, not a zero-padded 1,536-byte MTU slot. The buffers retain full MTU capacity without making every small packet pay for it on the queue.
 
 ## Flow-table design
