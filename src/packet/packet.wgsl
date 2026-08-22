@@ -491,7 +491,7 @@ fn classify_http_request(input_base: u32, payload_offset: u32, payload_len: u32)
     return RESPONSE_NOT_FOUND;
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let packet_index = gid.x;
     if packet_index >= params.packet_count {
