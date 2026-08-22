@@ -56,11 +56,11 @@ The response identifies itself with `X-Gput-Backend: gpu-packet`. Linux CI perfo
 ```bash
 cargo run --release --locked --bin gput-packet-bench -- \
   --backend both \
-  --flows 32768 \
+  --flows 65536 \
   --requests-per-flow 1000 \
   --warmup-requests-per-flow 20 \
-  --batch-size 32768 \
-  --flow-capacity 65536 \
+  --batch-size 65536 \
+  --flow-capacity 131072 \
   --flow-probe-limit 64
 ```
 
@@ -89,10 +89,10 @@ JSON output is available with `--json`.
 Environment variables can enlarge the arena:
 
 ```bash
-GPUT_PROOF_FLOWS=65536 \
+GPUT_PROOF_FLOWS=131072 \
 GPUT_PROOF_REQUESTS_PER_FLOW=2000 \
-GPUT_PROOF_BATCH_SIZE=65536 \
-GPUT_PROOF_FLOW_CAPACITY=131072 \
+GPUT_PROOF_BATCH_SIZE=131072 \
+GPUT_PROOF_FLOW_CAPACITY=262144 \
 ./scripts/prove-gpu.sh
 ```
 

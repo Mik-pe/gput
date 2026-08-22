@@ -89,10 +89,10 @@ The request does not terminate in a normal server TCP socket. The host kernel ro
 ```bash
 cargo run --release --locked --bin gput-packet-bench -- \
   --backend both \
-  --flows 32768 \
+  --flows 65536 \
   --requests-per-flow 1000 \
-  --batch-size 32768 \
-  --flow-capacity 65536 \
+  --batch-size 65536 \
+  --flow-capacity 131072 \
   --flow-probe-limit 64
 ```
 
@@ -116,6 +116,8 @@ GPU wave 2:
 ```
 
 Different flows run in parallel; the ordering dependency within each flow remains explicit. The TUN adapter gathers packets for a small configurable window before calling the engine, which finally gives the GPU a chance to eat a meal rather than being served one byte canapé per dispatch.
+
+On integrated GPUs with `MAPPABLE_PRIMARY_BUFFERS`, the output buffers are mapped directly after dispatch. Discrete adapters retain the portable copy-to-readback path, avoiding the performance penalty of host-mappable primary memory where CPU and GPU do not share RAM.
 
 Input metadata carries a compact word offset for each packet. A 70-byte request therefore uploads roughly 70 bytes, not a zero-padded 1,536-byte MTU slot. The buffers retain full MTU capacity without making every small packet pay for it on the queue.
 

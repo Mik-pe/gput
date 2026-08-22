@@ -61,17 +61,19 @@ The packet benchmark removes the kernel server socket from the measured engine a
 ```bash
 cargo run --release --locked --bin gput-packet-bench -- \
   --backend both \
-  --flows 32768 \
+  --flows 65536 \
   --requests-per-flow 1000 \
   --warmup-requests-per-flow 20 \
-  --batch-size 32768 \
-  --flow-capacity 65536 \
+  --batch-size 65536 \
+  --flow-capacity 131072 \
   --flow-probe-limit 64
 ```
 
 Every flow performs a raw SYN handshake, repeated persistent `/plaintext` exchanges and FIN cleanup. Every emitted IPv4/TCP checksum, sequence number, acknowledgement, status and body is validated outside the timed engine section.
 
 The throughput profile keeps one independent-flow round in one dispatch. Reducing `--batch-size` is a useful latency and underfilled-ingress experiment, but it mostly measures repeated submit/readback overhead rather than saturated GPU packet work.
+
+The default 65,536-flow profile is the measured throughput knee on an Apple M5. It is intentionally a saturation profile; publish smaller-batch latency results alongside it when latency matters.
 
 The CPU reference is deliberately straightforward and single-threaded. It exists to answer the crossover question for this exact state machine. It is not a substitute for comparisons against an optimized kernel stack, DPDK, AF_XDP or a production framework.
 
@@ -89,6 +91,36 @@ The report includes:
 - GPU-to-CPU-reference ratio when both are run
 
 Use `--json` for machine-readable results.
+
+### Apple M5 reference result (2026-08-22)
+
+Hardware was a 10-core CPU / 10-core GPU Apple M5 with 24 GiB unified memory, running macOS 26.5 on AC power with Low Power Mode disabled. Metal debug environment overrides were removed. Each paired run processed 32,768,000 requests per backend:
+
+```bash
+env -u MTL_DEBUG_LAYER -u METAL_DEVICE_WRAPPER_TYPE \
+  target/release/gput-packet-bench \
+  --backend both \
+  --flows 65536 \
+  --requests-per-flow 500 \
+  --warmup-requests-per-flow 50 \
+  --batch-size 65536 \
+  --flow-capacity 131072 \
+  --flow-probe-limit 64 \
+  --json
+```
+
+| Run | CPU reference req/s | GPU engine req/s |
+| ---: | ---: | ---: |
+| 1 | 7,262,403 | 17,130,889 |
+| 2 | 8,142,849 | 17,582,607 |
+| 3 | 7,290,237 | 17,131,692 |
+| 4 | 8,165,115 | 15,260,652 |
+| 5 | 4,440,312 | 16,823,961 |
+| **Median** | **7,290,237** | **17,130,889** |
+
+The GPU median is 2.35x the single-threaded CPU semantic reference, represents 34.26 million request-plus-response packets/s, and has 3.82 ms p50 / 4.13 ms p99 batch-round latency. Full-harness GPU throughput, including packet construction and response validation, was 5.37 million requests/s. The slower runs remain visible rather than being polished into the floorboards.
+
+This is a synthetic in-memory raw-packet engine result, not NIC throughput and not a socket HTTP result.
 
 ## Benchmark the real TUN path
 

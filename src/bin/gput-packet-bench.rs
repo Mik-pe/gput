@@ -30,7 +30,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = BackendChoice::Both)]
     backend: BackendChoice,
 
-    #[arg(long, default_value_t = 32_768)]
+    #[arg(long, default_value_t = 65_536)]
     flows: usize,
 
     #[arg(long, default_value_t = 1000)]
@@ -39,10 +39,10 @@ struct Cli {
     #[arg(long, default_value_t = 20)]
     warmup_requests_per_flow: usize,
 
-    #[arg(long, default_value_t = 32_768)]
+    #[arg(long, default_value_t = 65_536)]
     batch_size: usize,
 
-    #[arg(long, default_value_t = 65_536)]
+    #[arg(long, default_value_t = 131_072)]
     flow_capacity: usize,
 
     #[arg(long, default_value_t = 64)]

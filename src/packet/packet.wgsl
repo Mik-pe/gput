@@ -1,13 +1,11 @@
 struct PacketMeta {
     len: u32,
     word_offset: u32,
-    pad0: u32,
-    pad1: u32,
 }
 
 struct EngineParams {
     packet_count: u32,
-    input_stride_words: u32,
+    output_word_base: u32,
     output_stride_words: u32,
     flow_capacity: u32,
     listen_port: u32,
@@ -37,10 +35,9 @@ struct FlowSlot {
 
 @group(0) @binding(0) var<storage, read> input_meta: array<PacketMeta>;
 @group(0) @binding(1) var<storage, read> input_words: array<u32>;
-@group(0) @binding(2) var<storage, read_write> output_meta: array<PacketMeta>;
-@group(0) @binding(3) var<storage, read_write> output_words: array<u32>;
-@group(0) @binding(4) var<storage, read_write> flows: array<FlowSlot>;
-@group(0) @binding(5) var<uniform> params: EngineParams;
+@group(0) @binding(2) var<storage, read_write> output_data: array<u32>;
+@group(0) @binding(3) var<storage, read_write> flows: array<FlowSlot>;
+@group(0) @binding(4) var<uniform> params: EngineParams;
 
 const TCP_FIN: u32 = 0x01u;
 const TCP_SYN: u32 = 0x02u;
@@ -55,9 +52,8 @@ const STATE_TOMBSTONE: u32 = 3u;
 const STATE_CLAIMED: u32 = 0xffffffffu;
 const INVALID_INDEX: u32 = 0xffffffffu;
 
-fn read_byte(packet_index: u32, byte_index: u32) -> u32 {
-    let base = input_meta[packet_index].word_offset;
-    let word = input_words[base + byte_index / 4u];
+fn read_byte(input_base: u32, byte_index: u32) -> u32 {
+    let word = input_words[input_base + byte_index / 4u];
     return (word >> ((byte_index & 3u) * 8u)) & 0xffu;
 }
 
@@ -68,31 +64,29 @@ fn byte_swap_u32(value: u32) -> u32 {
         ((value & 0xff000000u) >> 24u);
 }
 
-fn read_u16_be(packet_index: u32, offset: u32) -> u32 {
-    let base = input_meta[packet_index].word_offset;
-    let word = input_words[base + offset / 4u];
+fn read_u16_be(input_base: u32, offset: u32) -> u32 {
+    let word = input_words[input_base + offset / 4u];
     let pair = (word >> ((offset & 2u) * 8u)) & 0xffffu;
     return ((pair & 0xffu) << 8u) | (pair >> 8u);
 }
 
-fn read_u32_be(packet_index: u32, offset: u32) -> u32 {
-    let base = input_meta[packet_index].word_offset;
-    return byte_swap_u32(input_words[base + offset / 4u]);
+fn read_u32_be(input_base: u32, offset: u32) -> u32 {
+    return byte_swap_u32(input_words[input_base + offset / 4u]);
 }
 
 fn write_u16_be(packet_index: u32, offset: u32, value: u32) {
-    let base = packet_index * params.output_stride_words;
+    let base = params.output_word_base + packet_index * params.output_stride_words;
     let word_index = base + offset / 4u;
     let shift = (offset & 2u) * 8u;
     let mask = 0xffffu << shift;
     let swapped = ((value & 0xffu) << 8u) | ((value >> 8u) & 0xffu);
-    output_words[word_index] =
-        (output_words[word_index] & ~mask) | (swapped << shift);
+    output_data[word_index] =
+        (output_data[word_index] & ~mask) | (swapped << shift);
 }
 
 fn write_u32_be(packet_index: u32, offset: u32, value: u32) {
-    let base = packet_index * params.output_stride_words;
-    output_words[base + offset / 4u] = byte_swap_u32(value);
+    let base = params.output_word_base + packet_index * params.output_stride_words;
+    output_data[base + offset / 4u] = byte_swap_u32(value);
 }
 
 fn flow_hash(src_ip: u32, dst_ip: u32, src_port: u32, dst_port: u32) -> u32 {
@@ -239,10 +233,10 @@ fn tcp_checksum(
 }
 
 fn write_ipv4(packet_index: u32, len: u32, src_ip: u32, dst_ip: u32) {
-    let base = packet_index * params.output_stride_words;
-    output_words[base] = byte_swap_u32(0x45000000u | len);
-    output_words[base + 1u] = byte_swap_u32(0x00004000u);
-    output_words[base + 2u] = byte_swap_u32(0x40060000u);
+    let base = params.output_word_base + packet_index * params.output_stride_words;
+    output_data[base] = byte_swap_u32(0x45000000u | len);
+    output_data[base + 1u] = byte_swap_u32(0x00004000u);
+    output_data[base + 2u] = byte_swap_u32(0x40060000u);
     write_u32_be(packet_index, 12u, src_ip);
     write_u32_be(packet_index, 16u, dst_ip);
 }
@@ -255,12 +249,12 @@ fn write_tcp(
     ack: u32,
     flags: u32,
 ) {
-    let base = packet_index * params.output_stride_words;
-    output_words[base + 5u] = byte_swap_u32((src_port << 16u) | dst_port);
+    let base = params.output_word_base + packet_index * params.output_stride_words;
+    output_data[base + 5u] = byte_swap_u32((src_port << 16u) | dst_port);
     write_u32_be(packet_index, 24u, seq);
     write_u32_be(packet_index, 28u, ack);
-    output_words[base + 8u] = byte_swap_u32(0x50000000u | (flags << 16u) | 0xffffu);
-    output_words[base + 9u] = 0u;
+    output_data[base + 8u] = byte_swap_u32(0x50000000u | (flags << 16u) | 0xffffu);
+    output_data[base + 9u] = 0u;
 }
 
 fn write_checksums(
@@ -296,14 +290,14 @@ fn write_checksums(
 
 fn write_http_response(packet_index: u32, response_id: u32) {
     let source_base = RESPONSE_WORD_OFFSETS[response_id];
-    let output_base = packet_index * params.output_stride_words + 10u;
+    let output_base = params.output_word_base + packet_index * params.output_stride_words + 10u;
     let word_count = RESPONSE_WORD_COUNTS[response_id];
     var word_index = 0u;
     loop {
         if word_index >= word_count {
             break;
         }
-        output_words[output_base + word_index] =
+        output_data[output_base + word_index] =
             RESPONSE_WORDS[source_base + word_index];
         word_index += 1u;
     }
@@ -342,10 +336,10 @@ fn emit_packet(
         flags,
         response_id,
     );
-    output_meta[packet_index].len = packet_len;
+    output_data[packet_index] = packet_len;
 }
 
-fn find_crlf(packet_index: u32, offset: u32, len: u32) -> u32 {
+fn find_crlf(input_base: u32, offset: u32, len: u32) -> u32 {
     if len < 2u {
         return INVALID_INDEX;
     }
@@ -354,8 +348,8 @@ fn find_crlf(packet_index: u32, offset: u32, len: u32) -> u32 {
         if index + 1u >= len {
             break;
         }
-        if read_byte(packet_index, offset + index) == 13u &&
-            read_byte(packet_index, offset + index + 1u) == 10u {
+        if read_byte(input_base, offset + index) == 13u &&
+            read_byte(input_base, offset + index + 1u) == 10u {
             return index;
         }
         index += 1u;
@@ -364,7 +358,7 @@ fn find_crlf(packet_index: u32, offset: u32, len: u32) -> u32 {
 }
 
 fn find_space(
-    packet_index: u32,
+    input_base: u32,
     offset: u32,
     start: u32,
     end: u32,
@@ -374,7 +368,7 @@ fn find_space(
         if index >= end {
             break;
         }
-        if read_byte(packet_index, offset + index) == 32u {
+        if read_byte(input_base, offset + index) == 32u {
             return index;
         }
         index += 1u;
@@ -382,14 +376,14 @@ fn find_space(
     return INVALID_INDEX;
 }
 
-fn method_is_get(packet_index: u32, offset: u32, len: u32) -> bool {
+fn method_is_get(input_base: u32, offset: u32, len: u32) -> bool {
     return len == 3u &&
-        read_byte(packet_index, offset) == 71u &&
-        read_byte(packet_index, offset + 1u) == 69u &&
-        read_byte(packet_index, offset + 2u) == 84u;
+        read_byte(input_base, offset) == 71u &&
+        read_byte(input_base, offset + 1u) == 69u &&
+        read_byte(input_base, offset + 2u) == 84u;
 }
 
-fn version_is_supported(packet_index: u32, offset: u32, len: u32) -> bool {
+fn version_is_supported(input_base: u32, offset: u32, len: u32) -> bool {
     if len != 8u {
         return false;
     }
@@ -399,16 +393,16 @@ fn version_is_supported(packet_index: u32, offset: u32, len: u32) -> bool {
         if index >= 7u {
             break;
         }
-        if read_byte(packet_index, offset + index) != expected[index] {
+        if read_byte(input_base, offset + index) != expected[index] {
             return false;
         }
         index += 1u;
     }
-    let minor = read_byte(packet_index, offset + 7u);
+    let minor = read_byte(input_base, offset + 7u);
     return minor == 48u || minor == 49u;
 }
 
-fn path_is_plaintext(packet_index: u32, offset: u32, len: u32) -> bool {
+fn path_is_plaintext(input_base: u32, offset: u32, len: u32) -> bool {
     if len != 10u {
         return false;
     }
@@ -420,7 +414,7 @@ fn path_is_plaintext(packet_index: u32, offset: u32, len: u32) -> bool {
         if index >= len {
             break;
         }
-        if read_byte(packet_index, offset + index) != expected[index] {
+        if read_byte(input_base, offset + index) != expected[index] {
             return false;
         }
         index += 1u;
@@ -428,7 +422,7 @@ fn path_is_plaintext(packet_index: u32, offset: u32, len: u32) -> bool {
     return true;
 }
 
-fn path_is_health(packet_index: u32, offset: u32, len: u32) -> bool {
+fn path_is_health(input_base: u32, offset: u32, len: u32) -> bool {
     if len != 7u {
         return false;
     }
@@ -438,7 +432,7 @@ fn path_is_health(packet_index: u32, offset: u32, len: u32) -> bool {
         if index >= len {
             break;
         }
-        if read_byte(packet_index, offset + index) != expected[index] {
+        if read_byte(input_base, offset + index) != expected[index] {
             return false;
         }
         index += 1u;
@@ -446,17 +440,17 @@ fn path_is_health(packet_index: u32, offset: u32, len: u32) -> bool {
     return true;
 }
 
-fn classify_http_request(packet_index: u32, payload_offset: u32, payload_len: u32) -> u32 {
-    let line_end = find_crlf(packet_index, payload_offset, payload_len);
+fn classify_http_request(input_base: u32, payload_offset: u32, payload_len: u32) -> u32 {
+    let line_end = find_crlf(input_base, payload_offset, payload_len);
     if line_end == INVALID_INDEX {
         return RESPONSE_BAD_REQUEST;
     }
-    let first_space = find_space(packet_index, payload_offset, 0u, line_end);
+    let first_space = find_space(input_base, payload_offset, 0u, line_end);
     if first_space == INVALID_INDEX {
         return RESPONSE_BAD_REQUEST;
     }
     let second_space = find_space(
-        packet_index,
+        input_base,
         payload_offset,
         first_space + 1u,
         line_end,
@@ -465,13 +459,13 @@ fn classify_http_request(packet_index: u32, payload_offset: u32, payload_len: u3
         return RESPONSE_BAD_REQUEST;
     }
     if !version_is_supported(
-        packet_index,
+        input_base,
         payload_offset + second_space + 1u,
         line_end - second_space - 1u,
     ) {
         return RESPONSE_BAD_REQUEST;
     }
-    if !method_is_get(packet_index, payload_offset, first_space) {
+    if !method_is_get(input_base, payload_offset, first_space) {
         return RESPONSE_METHOD_NOT_ALLOWED;
     }
 
@@ -482,66 +476,67 @@ fn classify_http_request(packet_index: u32, payload_offset: u32, payload_len: u3
         if index >= path_len {
             break;
         }
-        if read_byte(packet_index, path_offset + index) == 63u {
+        if read_byte(input_base, path_offset + index) == 63u {
             path_len = index;
             break;
         }
         index += 1u;
     }
-    if path_is_plaintext(packet_index, path_offset, path_len) {
+    if path_is_plaintext(input_base, path_offset, path_len) {
         return RESPONSE_PLAINTEXT;
     }
-    if path_is_health(packet_index, path_offset, path_len) {
+    if path_is_health(input_base, path_offset, path_len) {
         return RESPONSE_HEALTH;
     }
     return RESPONSE_NOT_FOUND;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let packet_index = gid.x;
     if packet_index >= params.packet_count {
         return;
     }
-    output_meta[packet_index].len = 0u;
+    output_data[packet_index] = 0u;
 
     let input_len = input_meta[packet_index].len;
+    let input_base = input_meta[packet_index].word_offset;
     if input_len < 40u {
         return;
     }
-    let version_ihl = read_byte(packet_index, 0u);
-    if version_ihl >> 4u != 4u || read_byte(packet_index, 9u) != 6u {
+    let version_ihl = read_byte(input_base, 0u);
+    if version_ihl >> 4u != 4u || read_byte(input_base, 9u) != 6u {
         return;
     }
     let ip_header_len = (version_ihl & 0x0fu) * 4u;
     if ip_header_len < 20u || ip_header_len + 20u > input_len {
         return;
     }
-    if (read_u16_be(packet_index, 6u) & 0x3fffu) != 0u {
+    if (read_u16_be(input_base, 6u) & 0x3fffu) != 0u {
         return;
     }
-    let total_len = read_u16_be(packet_index, 2u);
+    let total_len = read_u16_be(input_base, 2u);
     if total_len > input_len || total_len < ip_header_len + 20u {
         return;
     }
 
     let tcp_offset = ip_header_len;
-    let data_offset = (read_byte(packet_index, tcp_offset + 12u) >> 4u) * 4u;
+    let data_offset = (read_byte(input_base, tcp_offset + 12u) >> 4u) * 4u;
     if data_offset < 20u || tcp_offset + data_offset > total_len {
         return;
     }
     let payload_offset = tcp_offset + data_offset;
     let payload_len = total_len - payload_offset;
-    let src_ip = read_u32_be(packet_index, 12u);
-    let dst_ip = read_u32_be(packet_index, 16u);
-    let src_port = read_u16_be(packet_index, tcp_offset);
-    let dst_port = read_u16_be(packet_index, tcp_offset + 2u);
+    let src_ip = read_u32_be(input_base, 12u);
+    let dst_ip = read_u32_be(input_base, 16u);
+    let src_port = read_u16_be(input_base, tcp_offset);
+    let dst_port = read_u16_be(input_base, tcp_offset + 2u);
     if dst_port != params.listen_port {
         return;
     }
-    let seq = read_u32_be(packet_index, tcp_offset + 4u);
-    let ack = read_u32_be(packet_index, tcp_offset + 8u);
-    let flags = read_byte(packet_index, tcp_offset + 13u);
+    let seq = read_u32_be(input_base, tcp_offset + 4u);
+    let ack = read_u32_be(input_base, tcp_offset + 8u);
+    let flags = read_byte(input_base, tcp_offset + 13u);
     let key_hash = flow_hash(src_ip, dst_ip, src_port, dst_port);
     let ports = packed_ports(src_port, dst_port);
 
@@ -670,7 +665,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let response_id = classify_http_request(packet_index, payload_offset, payload_len);
+    let response_id = classify_http_request(input_base, payload_offset, payload_len);
     let response_len = RESPONSE_LENGTHS[response_id];
     var next_ack = seq + payload_len;
     if has_fin {

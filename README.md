@@ -202,10 +202,10 @@ Run the local proof suite:
 Or enlarge the arena while keeping one full independent-flow round in each dispatch:
 
 ```bash
-GPUT_PROOF_FLOWS=65536 \
+GPUT_PROOF_FLOWS=131072 \
 GPUT_PROOF_REQUESTS_PER_FLOW=2000 \
-GPUT_PROOF_BATCH_SIZE=65536 \
-GPUT_PROOF_FLOW_CAPACITY=131072 \
+GPUT_PROOF_BATCH_SIZE=131072 \
+GPUT_PROOF_FLOW_CAPACITY=262144 \
 ./scripts/prove-gpu.sh
 ```
 

@@ -11,9 +11,7 @@ pub use wire::{
 };
 
 use std::{
-    collections::HashSet,
     fmt::Write as _,
-    hash::{BuildHasherDefault, Hasher},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -30,8 +28,8 @@ const INPUT_PACKET_WORDS: usize = MAX_RAW_PACKET_BYTES.div_ceil(4);
 const FLOW_WORDS: usize = 16;
 const DEFAULT_FLOW_CAPACITY: usize = 4096;
 const DEFAULT_FLOW_PROBE_LIMIT: usize = 32;
-const WORKGROUP_SIZE: usize = 64;
-const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 5;
+const WORKGROUP_SIZE: usize = 256;
+const REQUIRED_STORAGE_BUFFERS_PER_SHADER_STAGE: u32 = 4;
 
 const RESPONSE_PLAINTEXT: u32 = 0;
 const RESPONSE_HEALTH: u32 = 1;
@@ -40,11 +38,11 @@ const RESPONSE_NOT_FOUND: u32 = 3;
 const RESPONSE_METHOD_NOT_ALLOWED: u32 = 4;
 
 const PACKET_RESPONSES: [&[u8]; 5] = [
-    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 14\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nHello, World!\n",
-    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 3\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nok\n",
-    b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 12\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nbad request\n",
-    b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 10\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nnot found\n",
-    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\nConnection: keep-alive\r\nServer: gput\r\nX-Gput-Backend: gpu-packet\r\n\r\nmethod not allowed\n",
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: keep-alive\r\nX-Gput-Backend: gpu-packet\r\n\r\nHello, World!\n",
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: keep-alive\r\nX-Gput-Backend: gpu-packet\r\n\r\nok\n",
+    b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: keep-alive\r\nX-Gput-Backend: gpu-packet\r\n\r\nbad request\n",
+    b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: keep-alive\r\nX-Gput-Backend: gpu-packet\r\n\r\nnot found\n",
+    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 19\r\nConnection: keep-alive\r\nX-Gput-Backend: gpu-packet\r\n\r\nmethod not allowed\n",
 ];
 
 #[repr(C)]
@@ -52,14 +50,13 @@ const PACKET_RESPONSES: [&[u8]; 5] = [
 struct PacketMeta {
     len: u32,
     word_offset: u32,
-    _padding: [u32; 2],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct EngineParams {
     packet_count: u32,
-    input_stride_words: u32,
+    output_word_base: u32,
     output_stride_words: u32,
     flow_capacity: u32,
     listen_port: u32,
@@ -75,34 +72,52 @@ struct PacketScratch {
     pending: Vec<usize>,
     deferred: Vec<usize>,
     wave: Vec<usize>,
-    seen: HashSet<FlowKey, BuildHasherDefault<FlowKeyHasher>>,
+    seen: FlowSet,
 }
 
-struct FlowKeyHasher(u32);
-
-impl Default for FlowKeyHasher {
-    fn default() -> Self {
-        Self(2_166_136_261)
-    }
+#[derive(Default)]
+struct FlowSet {
+    keys: Vec<FlowKey>,
+    generations: Vec<u32>,
+    generation: u32,
 }
 
-impl Hasher for FlowKeyHasher {
-    fn finish(&self) -> u64 {
-        u64::from(self.0)
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 = (self.0 ^ u32::from(byte)).wrapping_mul(16_777_619);
+impl FlowSet {
+    fn begin(&mut self, expected_keys: usize) {
+        let capacity = expected_keys.max(1).saturating_mul(2).next_power_of_two();
+        if self.keys.len() < capacity {
+            self.keys.resize(
+                capacity,
+                FlowKey {
+                    src_ip: 0,
+                    dst_ip: 0,
+                    src_port: 0,
+                    dst_port: 0,
+                },
+            );
+            self.generations.resize(capacity, 0);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generations.fill(0);
+            self.generation = 1;
         }
     }
 
-    fn write_u16(&mut self, value: u16) {
-        self.0 = (self.0 ^ u32::from(value)).wrapping_mul(16_777_619);
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.0 = (self.0 ^ value).wrapping_mul(16_777_619);
+    fn insert(&mut self, key: FlowKey) -> bool {
+        let mask = self.keys.len() - 1;
+        let mut index = wire::flow_hash(key) as usize & mask;
+        loop {
+            if self.generations[index] != self.generation {
+                self.keys[index] = key;
+                self.generations[index] = self.generation;
+                return true;
+            }
+            if self.keys[index] == key {
+                return false;
+            }
+            index = (index + 1) & mask;
+        }
     }
 }
 
@@ -205,12 +220,12 @@ pub struct GpuPacketEngine {
     bind_group: wgpu::BindGroup,
     input_meta: wgpu::Buffer,
     input_words: wgpu::Buffer,
-    output_meta: wgpu::Buffer,
-    output_words: wgpu::Buffer,
+    output: wgpu::Buffer,
     _flow_state: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    readback: Option<wgpu::Buffer>,
     params: wgpu::Buffer,
     config: PacketEngineConfig,
+    direct_output_mapping: bool,
     input_word_capacity: usize,
     output_stride_words: usize,
     adapter_name: String,
@@ -248,6 +263,10 @@ impl GpuPacketEngine {
             .await
             .context("no compute-capable GPU adapter available for packet engine")?;
         let adapter_info = adapter.get_info();
+        let direct_output_mapping = adapter_info.device_type == wgpu::DeviceType::IntegratedGpu
+            && adapter
+                .features()
+                .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
         let downlevel_capabilities = adapter.get_downlevel_capabilities();
         ensure!(
             downlevel_capabilities
@@ -265,7 +284,11 @@ impl GpuPacketEngine {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gput-packet-device"),
-                required_features: wgpu::Features::empty(),
+                required_features: if direct_output_mapping {
+                    wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+                } else {
+                    wgpu::Features::empty()
+                },
                 required_limits,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -280,10 +303,14 @@ impl GpuPacketEngine {
             source: wgpu::ShaderSource::Wgsl(shader_source.as_str().into()),
         });
 
-        let packet_meta_bytes = config
+        let input_meta_bytes = config
             .max_batch_size
             .checked_mul(std::mem::size_of::<PacketMeta>())
-            .context("packet metadata buffer size overflow")?;
+            .context("packet input metadata buffer size overflow")?;
+        let output_meta_bytes = config
+            .max_batch_size
+            .checked_mul(std::mem::size_of::<u32>())
+            .context("packet output metadata buffer size overflow")?;
         let requested_input_words_bytes = config
             .max_batch_size
             .checked_mul(INPUT_PACKET_WORDS)
@@ -297,9 +324,10 @@ impl GpuPacketEngine {
             .checked_mul(output_stride_words)
             .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
             .context("packet output buffer size overflow")?;
-        let readback_bytes = packet_meta_bytes
+        let output_bytes = output_meta_bytes
             .checked_add(output_words_bytes)
-            .context("combined packet readback size overflow")?;
+            .context("combined packet output size overflow")?;
+        let readback_bytes = output_bytes;
         let flow_words = config
             .flow_capacity
             .checked_mul(FLOW_WORDS)
@@ -308,12 +336,12 @@ impl GpuPacketEngine {
             .checked_mul(std::mem::size_of::<u32>())
             .context("flow buffer size overflow")?;
         ensure!(
-            packet_meta_bytes <= max_storage_binding_bytes,
-            "packet metadata needs {packet_meta_bytes} bytes, above the adapter binding limit of {max_storage_binding_bytes}"
+            input_meta_bytes <= max_storage_binding_bytes,
+            "packet input metadata needs {input_meta_bytes} bytes, above the adapter binding limit of {max_storage_binding_bytes}"
         );
         ensure!(
-            output_words_bytes <= max_storage_binding_bytes,
-            "packet output needs {output_words_bytes} bytes, above the adapter binding limit of {max_storage_binding_bytes}"
+            output_bytes <= max_storage_binding_bytes,
+            "packet output needs {output_bytes} bytes, above the adapter binding limit of {max_storage_binding_bytes}"
         );
         ensure!(
             flow_bytes <= max_storage_binding_bytes,
@@ -324,14 +352,17 @@ impl GpuPacketEngine {
             "packet readback needs {readback_bytes} bytes, above the adapter buffer limit of {max_buffer_bytes}"
         );
 
-        let input_meta = storage_buffer(&device, "packet input metadata", packet_meta_bytes, false);
+        let input_meta = storage_buffer(&device, "packet input metadata", input_meta_bytes, false);
         let input_words = storage_buffer(&device, "packet input words", input_words_bytes, false);
-        let output_meta =
-            storage_buffer(&device, "packet output metadata", packet_meta_bytes, false);
-        let output_words =
-            storage_buffer(&device, "packet output words", output_words_bytes, false);
+        let output = output_buffer(
+            &device,
+            "packet output",
+            output_bytes,
+            direct_output_mapping,
+        );
         let flow_state = storage_buffer(&device, "packet TCP flow state", flow_bytes, false);
-        let readback = storage_buffer(&device, "combined packet readback", readback_bytes, true);
+        let readback = (!direct_output_mapping)
+            .then(|| storage_buffer(&device, "combined packet readback", readback_bytes, true));
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("packet engine params"),
             size: std::mem::size_of::<EngineParams>() as u64,
@@ -348,9 +379,8 @@ impl GpuPacketEngine {
                 storage_layout(1, true),
                 storage_layout(2, false),
                 storage_layout(3, false),
-                storage_layout(4, false),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5,
+                    binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -367,10 +397,9 @@ impl GpuPacketEngine {
             entries: &[
                 buffer_entry(0, &input_meta),
                 buffer_entry(1, &input_words),
-                buffer_entry(2, &output_meta),
-                buffer_entry(3, &output_words),
-                buffer_entry(4, &flow_state),
-                buffer_entry(5, &params),
+                buffer_entry(2, &output),
+                buffer_entry(3, &flow_state),
+                buffer_entry(4, &params),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -397,6 +426,7 @@ impl GpuPacketEngine {
             listen_port = config.listen_port,
             input_buffer_bytes = input_words_bytes,
             output_slot_bytes = output_stride_words * std::mem::size_of::<u32>(),
+            direct_output_mapping,
             "using collision-safe GPU-native packet engine"
         );
 
@@ -408,12 +438,12 @@ impl GpuPacketEngine {
             bind_group,
             input_meta,
             input_words,
-            output_meta,
-            output_words,
+            output,
             _flow_state: flow_state,
             readback,
             params,
             config,
+            direct_output_mapping,
             input_word_capacity,
             output_stride_words,
             adapter_name: adapter_info.name,
@@ -448,7 +478,7 @@ impl GpuPacketEngine {
 
         let params = EngineParams {
             packet_count: packet_count as u32,
-            input_stride_words: INPUT_PACKET_WORDS as u32,
+            output_word_base: packet_count as u32,
             output_stride_words: self.output_stride_words as u32,
             flow_capacity: self.config.flow_capacity as u32,
             listen_port: self.config.listen_port.into(),
@@ -465,7 +495,7 @@ impl GpuPacketEngine {
         self.upload_nanos
             .fetch_add(duration_nanos(upload_started.elapsed()), Ordering::Relaxed);
 
-        let meta_copy_bytes = (packet_count * std::mem::size_of::<PacketMeta>()) as u64;
+        let meta_copy_bytes = (packet_count * std::mem::size_of::<u32>()) as u64;
         let word_copy_bytes =
             (packet_count * self.output_stride_words * std::mem::size_of::<u32>()) as u64;
         let readback_copy_bytes = meta_copy_bytes + word_copy_bytes;
@@ -484,53 +514,75 @@ impl GpuPacketEngine {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(packet_count.div_ceil(WORKGROUP_SIZE) as u32, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&self.output_meta, 0, &self.readback, 0, meta_copy_bytes);
-        encoder.copy_buffer_to_buffer(
-            &self.output_words,
-            0,
-            &self.readback,
-            meta_copy_bytes,
-            word_copy_bytes,
-        );
+        if let Some(readback) = &self.readback {
+            encoder.copy_buffer_to_buffer(&self.output, 0, readback, 0, readback_copy_bytes);
+        }
         self.queue.submit(Some(encoder.finish()));
         self.submit_nanos
             .fetch_add(duration_nanos(submit_started.elapsed()), Ordering::Relaxed);
 
         let readback_started = Instant::now();
-        let readback = map_read(&self.device, &self.readback, readback_copy_bytes)?;
-        self.readback_nanos.fetch_add(
-            duration_nanos(readback_started.elapsed()),
-            Ordering::Relaxed,
-        );
-        let decode_started = Instant::now();
-        let decode_result = {
-            let (meta_bytes, word_bytes) = readback.split_at(meta_copy_bytes as usize);
-            let output_meta: &[PacketMeta] = bytemuck::cast_slice(meta_bytes);
+        let decode_result = if self.direct_output_mapping {
+            let output_slice = self.output.slice(0..readback_copy_bytes);
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            output_slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+            self.device.poll(wgpu::PollType::wait_indefinitely())?;
+            receiver
+                .recv()
+                .context("GPU packet output callback disappeared")??;
+            let mapped_output = output_slice.get_mapped_range()?;
+            self.readback_nanos.fetch_add(
+                duration_nanos(readback_started.elapsed()),
+                Ordering::Relaxed,
+            );
+            let decode_started = Instant::now();
+            let (meta_bytes, word_bytes) = mapped_output.split_at(meta_copy_bytes as usize);
+            let output_meta: &[u32] = bytemuck::cast_slice(meta_bytes);
             let output_words: &[u32] = bytemuck::cast_slice(word_bytes);
-            for (index, (meta, &source_index)) in output_meta.iter().zip(wave.iter()).enumerate() {
-                let len = meta.len as usize;
-                if len == 0 {
-                    output[source_index] = None;
-                    continue;
-                }
-                ensure!(
-                    len <= self.output_stride_words * std::mem::size_of::<u32>(),
-                    "GPU produced packet of {len} bytes outside the tight response slot"
-                );
-                let base = index * self.output_stride_words;
-                assign_packet_words(
-                    &mut output[source_index],
-                    &output_words[base..base + self.output_stride_words],
-                    len,
-                )?;
-            }
-            Ok::<_, anyhow::Error>(())
+            let result = decode_wave_outputs(
+                output_meta,
+                output_words,
+                wave,
+                self.output_stride_words,
+                output,
+            );
+            drop(mapped_output);
+            self.output.unmap();
+            self.decode_nanos
+                .fetch_add(duration_nanos(decode_started.elapsed()), Ordering::Relaxed);
+            result
+        } else {
+            let readback = self
+                .readback
+                .as_ref()
+                .context("packet readback buffer is unavailable")?;
+            let readback = map_read(&self.device, readback, readback_copy_bytes)?;
+            self.readback_nanos.fetch_add(
+                duration_nanos(readback_started.elapsed()),
+                Ordering::Relaxed,
+            );
+            let decode_started = Instant::now();
+            let (meta_bytes, word_bytes) = readback.split_at(meta_copy_bytes as usize);
+            let output_meta: &[u32] = bytemuck::cast_slice(meta_bytes);
+            let output_words: &[u32] = bytemuck::cast_slice(word_bytes);
+            let result = decode_wave_outputs(
+                output_meta,
+                output_words,
+                wave,
+                self.output_stride_words,
+                output,
+            );
+            drop(readback);
+            self.readback
+                .as_ref()
+                .expect("fallback readback buffer exists")
+                .unmap();
+            self.decode_nanos
+                .fetch_add(duration_nanos(decode_started.elapsed()), Ordering::Relaxed);
+            result
         };
-
-        drop(readback);
-        self.readback.unmap();
-        self.decode_nanos
-            .fetch_add(duration_nanos(decode_started.elapsed()), Ordering::Relaxed);
         self.dispatches.fetch_add(1, Ordering::Relaxed);
         self.packets
             .fetch_add(packet_count as u64, Ordering::Relaxed);
@@ -560,16 +612,47 @@ impl PacketEngine for GpuPacketEngine {
             .scratch
             .lock()
             .map_err(|_| anyhow::anyhow!("GPU packet scratch buffer poisoned"))?;
-        scratch.keys.clear();
-        scratch
-            .keys
-            .extend(packets.iter().map(wire::scheduling_flow_key));
         scratch.pending.clear();
-        scratch.pending.extend(0..packets.len());
+        {
+            let PacketScratch {
+                keys,
+                deferred,
+                wave,
+                seen,
+                ..
+            } = &mut *scratch;
+            fill_initial_wave(
+                packets,
+                (self.config.max_batch_size, self.input_word_capacity),
+                seen,
+                keys,
+                wave,
+                deferred,
+            );
+        }
         schedule_elapsed += schedule_started.elapsed();
 
-        while !scratch.pending.is_empty() {
-            let fill_started = Instant::now();
+        loop {
+            {
+                let PacketScratch {
+                    metadata,
+                    words,
+                    wave,
+                    ..
+                } = &mut *scratch;
+                self.dispatch_wave(packets, wave, metadata, words, output)?;
+            }
+            let next_wave_started = Instant::now();
+            {
+                let PacketScratch {
+                    pending, deferred, ..
+                } = &mut *scratch;
+                std::mem::swap(pending, deferred);
+            }
+            if scratch.pending.is_empty() {
+                schedule_elapsed += next_wave_started.elapsed();
+                break;
+            }
             {
                 let PacketScratch {
                     keys,
@@ -589,25 +672,7 @@ impl PacketEngine for GpuPacketEngine {
                     deferred,
                 );
             }
-            schedule_elapsed += fill_started.elapsed();
-
-            {
-                let PacketScratch {
-                    metadata,
-                    words,
-                    wave,
-                    ..
-                } = &mut *scratch;
-                self.dispatch_wave(packets, wave, metadata, words, output)?;
-            }
-            let scatter_started = Instant::now();
-            {
-                let PacketScratch {
-                    pending, deferred, ..
-                } = &mut *scratch;
-                std::mem::swap(pending, deferred);
-            }
-            schedule_elapsed += scatter_started.elapsed();
+            schedule_elapsed += next_wave_started.elapsed();
         }
         self.schedule_nanos
             .fetch_add(duration_nanos(schedule_elapsed), Ordering::Relaxed);
@@ -710,12 +775,12 @@ fn fill_next_wave(
     keys: &[Option<FlowKey>],
     pending: &[usize],
     limits: (usize, usize),
-    seen: &mut HashSet<FlowKey, BuildHasherDefault<FlowKeyHasher>>,
+    seen: &mut FlowSet,
     wave: &mut Vec<usize>,
     deferred: &mut Vec<usize>,
 ) {
     let (max_batch_size, max_input_words) = limits;
-    seen.clear();
+    seen.begin(pending.len());
     wave.clear();
     deferred.clear();
 
@@ -730,6 +795,41 @@ fn fill_next_wave(
             continue;
         }
         if let Some(key) = keys[index]
+            && !seen.insert(key)
+        {
+            deferred.push(index);
+            continue;
+        }
+        wave.push(index);
+        input_words += packet_words;
+    }
+}
+
+fn fill_initial_wave(
+    packets: &[RawPacket],
+    limits: (usize, usize),
+    seen: &mut FlowSet,
+    keys: &mut Vec<Option<FlowKey>>,
+    wave: &mut Vec<usize>,
+    deferred: &mut Vec<usize>,
+) {
+    let (max_batch_size, max_input_words) = limits;
+    seen.begin(packets.len());
+    keys.clear();
+    wave.clear();
+    deferred.clear();
+    keys.reserve(packets.len());
+
+    let mut input_words = 0_usize;
+    for (index, packet) in packets.iter().enumerate() {
+        let key = wire::scheduling_flow_key(packet);
+        keys.push(key);
+        let packet_words = packet.bytes.len().div_ceil(std::mem::size_of::<u32>());
+        if wave.len() == max_batch_size || input_words + packet_words > max_input_words {
+            deferred.push(index);
+            continue;
+        }
+        if let Some(key) = key
             && !seen.insert(key)
         {
             deferred.push(index);
@@ -852,6 +952,24 @@ fn storage_buffer(
     })
 }
 
+fn output_buffer(
+    device: &wgpu::Device,
+    label: &'static str,
+    size: usize,
+    direct_mapping: bool,
+) -> wgpu::Buffer {
+    let mut usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+    if direct_mapping {
+        usage |= wgpu::BufferUsages::MAP_READ;
+    }
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size as u64,
+        usage,
+        mapped_at_creation: false,
+    })
+}
+
 fn storage_layout(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -921,7 +1039,6 @@ fn pack_wave_inputs(
             len: u32::try_from(packet.bytes.len()).context("packet length does not fit u32")?,
             word_offset: u32::try_from(word_offset)
                 .context("packet word offset does not fit u32")?,
-            _padding: [0; 2],
         });
     }
     Ok(())
@@ -944,6 +1061,30 @@ fn assign_packet_words(slot: &mut Option<RawPacket>, words: &[u32], len: usize) 
         packet.bytes.extend_from_slice(&source[..len]);
     } else {
         *slot = Some(RawPacket::new(source[..len].to_vec())?);
+    }
+    Ok(())
+}
+
+fn decode_wave_outputs(
+    metadata: &[u32],
+    words: &[u32],
+    wave: &[usize],
+    output_stride_words: usize,
+    output: &mut [Option<RawPacket>],
+) -> Result<()> {
+    for (index, (&len, &source_index)) in metadata.iter().zip(wave.iter()).enumerate() {
+        let len = len as usize;
+        if len == 0 {
+            output[source_index] = None;
+            continue;
+        }
+        ensure!(
+            len <= output_stride_words * std::mem::size_of::<u32>(),
+            "GPU produced packet of {len} bytes outside the tight response slot"
+        );
+        let base = index * output_stride_words;
+        let packet_words = &words[base..base + output_stride_words];
+        assign_packet_words(&mut output[source_index], packet_words, len)?;
     }
     Ok(())
 }
@@ -998,7 +1139,7 @@ mod tests {
     fn response_slots_are_tight_instead_of_mtu_sized_furniture_vans() {
         let response_bytes = max_response_packet_bytes();
         assert!(response_bytes < MAX_RAW_PACKET_BYTES / 2);
-        assert_eq!(response_bytes.div_ceil(std::mem::size_of::<u32>()), 56);
+        assert_eq!(response_bytes.div_ceil(std::mem::size_of::<u32>()), 48);
     }
 
     #[test]
@@ -1059,7 +1200,7 @@ mod tests {
             .iter()
             .map(|packet| parse_ipv4_tcp(packet).map(|tcp| tcp.key))
             .collect::<Vec<_>>();
-        let mut seen = HashSet::default();
+        let mut seen = FlowSet::default();
         let mut pending = vec![0, 1, 2];
         let mut deferred = Vec::new();
         let mut wave = Vec::new();
@@ -1094,7 +1235,7 @@ mod tests {
             RawPacket::new(vec![2; 8]).expect("second packet"),
         ];
         let keys = vec![None, None];
-        let mut seen = HashSet::default();
+        let mut seen = FlowSet::default();
         let mut deferred = Vec::new();
         let mut wave = Vec::new();
 
@@ -1110,6 +1251,38 @@ mod tests {
 
         assert_eq!(wave, vec![0]);
         assert_eq!(deferred, vec![1]);
+    }
+
+    #[test]
+    fn flow_set_resolves_collisions_exactly_and_reuses_generations() {
+        let first = FlowKey {
+            src_ip: 1,
+            dst_ip: 2,
+            src_port: 3,
+            dst_port: 4,
+        };
+        let colliding_port = (5..=u16::MAX)
+            .find(|&port| {
+                let candidate = FlowKey {
+                    src_port: port,
+                    ..first
+                };
+                wire::flow_hash(candidate) & 3 == wire::flow_hash(first) & 3
+            })
+            .expect("a low-bit hash collision exists");
+        let second = FlowKey {
+            src_port: colliding_port,
+            ..first
+        };
+        let mut set = FlowSet::default();
+        set.begin(2);
+
+        assert!(set.insert(first));
+        assert!(set.insert(second));
+        assert!(!set.insert(first));
+
+        set.begin(2);
+        assert!(set.insert(first));
     }
 
     #[test]
