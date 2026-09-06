@@ -9,5 +9,5 @@ pub mod protocol;
 pub mod router;
 mod server;
 
-pub use router::{Router, builtin_router, response, routing};
+pub use router::{Body, Response, Router, Status, builtin_router, response, routing};
 pub use server::serve;

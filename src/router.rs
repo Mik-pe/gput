@@ -60,7 +60,10 @@ impl Body {
     pub fn literal(mut self, literal: impl Into<String>) -> Self {
         let literal = literal.into();
         if !literal.is_empty() {
-            self.segments.push(BodySegment::Literal(literal));
+            match self.segments.last_mut() {
+                Some(BodySegment::Literal(previous)) => previous.push_str(&literal),
+                _ => self.segments.push(BodySegment::Literal(literal)),
+            }
         }
         self
     }
@@ -70,12 +73,16 @@ impl Body {
     }
 
     pub fn path(mut self, max_bytes: usize) -> Self {
-        self.segments.push(BodySegment::Path { max_bytes });
+        if max_bytes != 0 {
+            self.segments.push(BodySegment::Path { max_bytes });
+        }
         self
     }
 
     pub fn query(mut self, max_bytes: usize) -> Self {
-        self.segments.push(BodySegment::Query { max_bytes });
+        if max_bytes != 0 {
+            self.segments.push(BodySegment::Query { max_bytes });
+        }
         self
     }
 
@@ -95,10 +102,12 @@ impl Body {
     }
 
     pub fn backend_variant(mut self, cpu: impl Into<String>, gpu: impl Into<String>) -> Self {
-        self.segments.push(BodySegment::BackendVariant {
-            cpu: cpu.into(),
-            gpu: gpu.into(),
-        });
+        let cpu = cpu.into();
+        let gpu = gpu.into();
+        if cpu == gpu {
+            return self.literal(cpu);
+        }
+        self.segments.push(BodySegment::BackendVariant { cpu, gpu });
         self
     }
 }
@@ -169,6 +178,24 @@ impl Response {
     }
 }
 
+impl From<&str> for Response {
+    fn from(value: &str) -> Self {
+        Self::text(value)
+    }
+}
+
+impl From<String> for Response {
+    fn from(value: String) -> Self {
+        Self::text(value)
+    }
+}
+
+impl From<Body> for Response {
+    fn from(value: Body) -> Self {
+        Self::text(value)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MethodRouter {
     get: Response,
@@ -177,8 +204,10 @@ pub struct MethodRouter {
 pub mod routing {
     use super::{MethodRouter, Response};
 
-    pub fn get(response: Response) -> MethodRouter {
-        MethodRouter { get: response }
+    pub fn get(response: impl Into<Response>) -> MethodRouter {
+        MethodRouter {
+            get: response.into(),
+        }
     }
 }
 
@@ -223,6 +252,19 @@ impl Router {
             response: method_router.get,
         });
         self
+    }
+
+    /// Declare a GPU-compiled GET response. Strings and body programs become text responses.
+    ///
+    /// ```
+    /// use gput::{Body, Response, Router};
+    /// let app = Router::new()
+    ///     .get("/plaintext", "Hello, World!\n")
+    ///     .get("/query", Body::new().push("query=").query(64))
+    ///     .get("/json", Response::json("{\"ok\":true}"));
+    /// ```
+    pub fn get(self, path: impl Into<String>, response: impl Into<Response>) -> Self {
+        self.route(path, routing::get(response))
     }
 
     pub fn fallback(mut self, response: Response) -> Self {
@@ -864,6 +906,43 @@ mod tests {
 
     fn compile(router: Router) -> CompiledRouter {
         router.compile().expect("router compiles")
+    }
+
+    #[test]
+    fn folds_adjacent_literals_and_noop_segments_before_emitting_bytecode() {
+        let body = Body::new()
+            .push("å")
+            .push("")
+            .path(0)
+            .query(0)
+            .backend_variant("€", "€")
+            .push("🦉");
+        let router = compile(Router::new().get("/folded", body));
+        let response = &router.routes[0].response;
+        assert_eq!(response.segments.len(), 1);
+        assert_eq!(response.max_gpu_body_bytes, "å€🦉".len());
+        assert_eq!(response.max_cpu_body_bytes, "å€🦉".len());
+        let offset = router.router_words[3] as usize;
+        assert_eq!(router.router_words[offset + 4], 1);
+        for backend in ["cpu", "gpu"] {
+            assert!(
+                router
+                    .route_request(b"GET /folded HTTP/1.1\r\n\r\n", backend)
+                    .ends_with("\r\n\r\nå€🦉".as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn literal_folding_does_not_cross_dynamic_operations() {
+        let body = Body::new().push("a").query(2).push("b").push("c");
+        let router = compile(Router::new().get("/dynamic", body));
+        assert_eq!(router.routes[0].response.segments.len(), 3);
+        assert!(
+            router
+                .route_request(b"GET /dynamic?123 HTTP/1.1\r\n\r\n", "gpu")
+                .ends_with(b"\r\n\r\na12bc")
+        );
     }
 
     #[test]

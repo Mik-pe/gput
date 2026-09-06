@@ -8,9 +8,7 @@ use std::{
 };
 
 use anyhow::{Result as AnyResult, ensure};
-use crossbeam_channel::{
-    Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded,
-};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tracing::{debug, error};
@@ -130,11 +128,7 @@ pub fn spawn_batcher(
     Ok((BatcherHandle { sender, metrics }, worker))
 }
 
-fn collect_jobs(
-    receiver: &Receiver<Job>,
-    jobs: &mut Vec<Job>,
-    config: &BatcherConfig,
-) {
+fn collect_jobs(receiver: &Receiver<Job>, jobs: &mut Vec<Job>, config: &BatcherConfig) {
     let started = Instant::now();
     while jobs.len() < config.max_batch_size {
         // A zero wait disables sleeping, not batching. Drain ready work before

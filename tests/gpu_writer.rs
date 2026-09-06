@@ -102,7 +102,10 @@ fn packed_gpu_writer_matches_cpu_across_alignments_and_reused_slots() {
         .route(
             "/backend",
             get(Response::text(
-                Body::new().backend().push(":").backend_variant("cpu body", "🦉"),
+                Body::new()
+                    .backend()
+                    .push(":")
+                    .backend_variant("cpu body", "🦉"),
             )),
         );
     inputs.extend([
@@ -134,7 +137,11 @@ fn packed_gpu_writer_matches_cpu_across_alignments_and_reused_slots() {
         assert_eq!(actual.len(), count);
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             assert_content_length(actual);
-            assert_eq!(actual, &gpu_header(expected), "round {round}, request {index}");
+            assert_eq!(
+                actual,
+                &gpu_header(expected),
+                "round {round}, request {index}"
+            );
         }
     }
 
