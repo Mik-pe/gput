@@ -72,7 +72,9 @@ fn shorthand_and_explicit_routes_compile_to_identical_responses() {
     let mut explicit = CpuProcessor::with_router(explicit).expect("explicit router compiles");
     assert_eq!(
         short.process_batch(&requests).expect("shorthand responses"),
-        explicit.process_batch(&requests).expect("explicit responses")
+        explicit
+            .process_batch(&requests)
+            .expect("explicit responses")
     );
 }
 
