@@ -1,34 +1,28 @@
 use anyhow::Result;
-use gput::{
-    Router,
-    config::ServerConfig,
-    response::{Body, Response},
-    routing::get,
-};
+use gput::{Body, Response, Router, config::ServerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let app = Router::new()
-        .route(
+        .get(
             "/",
-            get(Response::html(
+            Response::html(
                 "<h1>hello from unreasonable hardware</h1>\n<p>Try <code>/inspect?owl=yes</code>.</p>\n",
-            )),
+            ),
         )
-        .route(
+        .get("/plaintext", "Hello, World!\n")
+        .get(
             "/inspect",
-            get(Response::text(
-                Body::new()
-                    .push("path=")
-                    .path(128)
-                    .push("\nquery=")
-                    .query(128)
-                    .push("\nbackend=")
-                    .backend()
-                    .push("\npath_hash=")
-                    .path_hash()
-                    .push("\n"),
-            )),
+            Body::new()
+                .push("path=")
+                .path(128)
+                .push("\nquery=")
+                .query(128)
+                .push("\nbackend=")
+                .backend()
+                .push("\npath_hash=")
+                .path_hash()
+                .push("\n"),
         );
 
     let config = ServerConfig::default();

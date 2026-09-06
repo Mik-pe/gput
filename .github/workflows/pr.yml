@@ -1,0 +1,49 @@
+name: pull-request
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust and software Vulkan
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends mesa-vulkan-drivers
+
+      - name: Rust, shader, and socket checks
+        shell: bash
+        run: |
+          export WGPU_BACKEND=vulkan
+          export VK_DRIVER_FILES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          test -n "$VK_DRIVER_FILES"
+          export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          export LIBGL_ALWAYS_SOFTWARE=true
+          export GALLIUM_DRIVER=llvmpipe
+          trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
+          status=0
+          cargo +1.97.1 fmt --check || status=1
+          cargo +1.97.1 clippy --locked --all-targets --all-features -- -D warnings || status=1
+          cargo +1.97.1 test --locked --all-features || status=1
+          cargo +1.97.1 test --locked --test gpu_writer -- --ignored || status=1
+          if cargo +1.97.1 build --locked --bins; then
+            GPUT_SMOKE_PORT=18080 bash scripts/smoke.sh cpu target/debug/gput || status=1
+            GPUT_SMOKE_PORT=18081 bash scripts/smoke.sh gpu target/debug/gput || status=1
+          else
+            status=1
+          fi
+          exit "$status"
