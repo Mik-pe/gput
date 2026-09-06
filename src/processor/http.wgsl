@@ -34,14 +34,7 @@ struct Writer {
     request_index: u32,
     cursor: u32,
     flags: u32,
-    _padding: u32,
-};
-
-struct Utf8Scalar {
-    code_point: u32,
-    byte_width: u32,
-    valid: u32,
-    _padding: u32,
+    pending: u32,
 };
 
 struct RequestTarget {
@@ -98,7 +91,6 @@ const BODY_OP_ARG_0: u32 = 1u;
 const BODY_OP_ARG_1: u32 = 2u;
 
 const RESPONSE_FLAG_OUTPUT_OVERFLOW: u32 = 1u;
-const RESPONSE_FLAG_INVALID_UTF8: u32 = 2u;
 const RESPONSE_FLAG_INVALID_PROGRAM: u32 = 4u;
 
 fn request_byte(request_index: u32, byte_index: u32) -> u32 {
@@ -107,11 +99,34 @@ fn request_byte(request_index: u32, byte_index: u32) -> u32 {
     return (input_words[word_index] >> shift) & 255u;
 }
 
+// Call only for four bytes inside the request, not for a partial tail.
+fn request_word(request_index: u32, byte_index: u32) -> u32 {
+    let word_index = request_meta[request_index].word_offset + byte_index / 4u;
+    let shift = (byte_index & 3u) * 8u;
+    let low = input_words[word_index];
+    if (shift == 0u) {
+        return low;
+    }
+    return (low >> shift) | (input_words[word_index + 1u] << (32u - shift));
+}
+
 fn string_byte(string_id: u32, byte_index: u32) -> u32 {
     let absolute_index = string_meta[string_id].byte_offset + byte_index;
     let word = string_words[absolute_index / 4u];
     let shift = (absolute_index & 3u) * 8u;
     return (word >> shift) & 255u;
+}
+
+// The immutable arena is byte-packed; strings need not start on a word boundary.
+fn string_word(string_id: u32, byte_index: u32) -> u32 {
+    let absolute_index = string_meta[string_id].byte_offset + byte_index;
+    let word_index = absolute_index / 4u;
+    let shift = (absolute_index & 3u) * 8u;
+    let low = string_words[word_index];
+    if (shift == 0u) {
+        return low;
+    }
+    return (low >> shift) | (string_words[word_index + 1u] << (32u - shift));
 }
 
 fn route_word(route_index: u32, field: u32) -> u32 {
@@ -134,30 +149,62 @@ fn writer_fail(writer: ptr<function, Writer>, flag: u32) {
     (*writer).flags = (*writer).flags | flag;
 }
 
+// Each invocation owns its entire response slot. Assemble partial words locally;
+// never load old output bytes, including when reusing a slot for a shorter response.
 fn writer_push_byte(writer: ptr<function, Writer>, byte: u32) {
     if ((*writer).flags != 0u) {
         return;
     }
-
     let capacity = params.response_stride_words * 4u;
     if ((*writer).cursor >= capacity) {
         writer_fail(writer, RESPONSE_FLAG_OUTPUT_OVERFLOW);
         return;
     }
 
-    let absolute_index = (*writer).request_index * capacity + (*writer).cursor;
-    let word_index = absolute_index / 4u;
-    let shift = (absolute_index & 3u) * 8u;
-    let mask = 255u << shift;
-    output_words[word_index] =
-        (output_words[word_index] & ~mask) | ((byte & 255u) << shift);
+    let shift = ((*writer).cursor & 3u) * 8u;
+    (*writer).pending = (*writer).pending | ((byte & 255u) << shift);
     (*writer).cursor = (*writer).cursor + 1u;
+    if (((*writer).cursor & 3u) == 0u) {
+        let word_index = (*writer).request_index * params.response_stride_words
+            + (*writer).cursor / 4u - 1u;
+        output_words[word_index] = (*writer).pending;
+        (*writer).pending = 0u;
+    }
+}
+
+fn writer_push_word(writer: ptr<function, Writer>, word: u32) {
+    if ((*writer).flags != 0u) {
+        return;
+    }
+    let capacity = params.response_stride_words * 4u;
+    if (capacity - (*writer).cursor < 4u) {
+        writer_fail(writer, RESPONSE_FLAG_OUTPUT_OVERFLOW);
+        return;
+    }
+
+    let shift = ((*writer).cursor & 3u) * 8u;
+    let word_index = (*writer).request_index * params.response_stride_words
+        + (*writer).cursor / 4u;
+    output_words[word_index] = (*writer).pending | (word << shift);
+    (*writer).cursor = (*writer).cursor + 4u;
+    (*writer).pending = 0u;
+    if (shift != 0u) {
+        (*writer).pending = word >> (32u - shift);
+    }
 }
 
 fn writer_push_string(writer: ptr<function, Writer>, string_id: u32) {
+    // Rust String validates UTF-8 before upload. Copy its bytes, rather than
+    // decoding and re-encoding the same immutable scalars on every request.
     let byte_len = string_meta[string_id].byte_len;
-    for (var byte_index = 0u; byte_index < byte_len; byte_index = byte_index + 1u) {
+    var byte_index = 0u;
+    while (byte_len - byte_index >= 4u) {
+        writer_push_word(writer, string_word(string_id, byte_index));
+        byte_index = byte_index + 4u;
+    }
+    while (byte_index < byte_len) {
         writer_push_byte(writer, string_byte(string_id, byte_index));
+        byte_index = byte_index + 1u;
     }
 }
 
@@ -167,8 +214,14 @@ fn writer_push_request_range(
     byte_start: u32,
     byte_len: u32,
 ) {
-    for (var byte_index = 0u; byte_index < byte_len; byte_index = byte_index + 1u) {
+    var byte_index = 0u;
+    while (byte_len - byte_index >= 4u) {
+        writer_push_word(writer, request_word(request_index, byte_start + byte_index));
+        byte_index = byte_index + 4u;
+    }
+    while (byte_index < byte_len) {
         writer_push_byte(writer, request_byte(request_index, byte_start + byte_index));
+        byte_index = byte_index + 1u;
     }
 }
 
@@ -197,161 +250,15 @@ fn writer_push_decimal(writer: ptr<function, Writer>, value: u32) {
     }
 }
 
-fn writer_push_code_point(writer: ptr<function, Writer>, code_point: u32) {
-    if (code_point <= 0x7fu) {
-        writer_push_byte(writer, code_point);
-        return;
-    }
-
-    if (code_point <= 0x7ffu) {
-        writer_push_byte(writer, 0xc0u | (code_point >> 6u));
-        writer_push_byte(writer, 0x80u | (code_point & 0x3fu));
-        return;
-    }
-
-    if (code_point >= 0xd800u && code_point <= 0xdfffu) {
-        writer_fail(writer, RESPONSE_FLAG_INVALID_UTF8);
-        return;
-    }
-
-    if (code_point <= 0xffffu) {
-        writer_push_byte(writer, 0xe0u | (code_point >> 12u));
-        writer_push_byte(writer, 0x80u | ((code_point >> 6u) & 0x3fu));
-        writer_push_byte(writer, 0x80u | (code_point & 0x3fu));
-        return;
-    }
-
-    if (code_point <= 0x10ffffu) {
-        writer_push_byte(writer, 0xf0u | (code_point >> 18u));
-        writer_push_byte(writer, 0x80u | ((code_point >> 12u) & 0x3fu));
-        writer_push_byte(writer, 0x80u | ((code_point >> 6u) & 0x3fu));
-        writer_push_byte(writer, 0x80u | (code_point & 0x3fu));
-        return;
-    }
-
-    writer_fail(writer, RESPONSE_FLAG_INVALID_UTF8);
-}
-
-fn invalid_utf8_scalar() -> Utf8Scalar {
-    return Utf8Scalar(0xfffdu, 1u, 0u, 0u);
-}
-
-fn is_utf8_continuation(byte: u32) -> bool {
-    return (byte & 0xc0u) == 0x80u;
-}
-
-fn decode_utf8_string(string_id: u32, byte_index: u32) -> Utf8Scalar {
-    let byte_len = string_meta[string_id].byte_len;
-    if (byte_index >= byte_len) {
-        return invalid_utf8_scalar();
-    }
-
-    let byte_0 = string_byte(string_id, byte_index);
-    if (byte_0 <= 0x7fu) {
-        return Utf8Scalar(byte_0, 1u, 1u, 0u);
-    }
-
-    if (byte_0 >= 0xc2u && byte_0 <= 0xdfu) {
-        if (byte_index + 1u >= byte_len) {
-            return invalid_utf8_scalar();
-        }
-        let byte_1 = string_byte(string_id, byte_index + 1u);
-        if (!is_utf8_continuation(byte_1)) {
-            return invalid_utf8_scalar();
-        }
-        let code_point = ((byte_0 & 0x1fu) << 6u) | (byte_1 & 0x3fu);
-        return Utf8Scalar(code_point, 2u, 1u, 0u);
-    }
-
-    if (byte_0 >= 0xe0u && byte_0 <= 0xefu) {
-        if (byte_index + 2u >= byte_len) {
-            return invalid_utf8_scalar();
-        }
-        let byte_1 = string_byte(string_id, byte_index + 1u);
-        let byte_2 = string_byte(string_id, byte_index + 2u);
-        if (!is_utf8_continuation(byte_2)) {
-            return invalid_utf8_scalar();
-        }
-
-        let second_is_valid =
-            (byte_0 == 0xe0u && byte_1 >= 0xa0u && byte_1 <= 0xbfu)
-            || (byte_0 == 0xedu && byte_1 >= 0x80u && byte_1 <= 0x9fu)
-            || (
-                byte_0 != 0xe0u
-                && byte_0 != 0xedu
-                && is_utf8_continuation(byte_1)
-            );
-        if (!second_is_valid) {
-            return invalid_utf8_scalar();
-        }
-
-        let code_point = ((byte_0 & 0x0fu) << 12u)
-            | ((byte_1 & 0x3fu) << 6u)
-            | (byte_2 & 0x3fu);
-        return Utf8Scalar(code_point, 3u, 1u, 0u);
-    }
-
-    if (byte_0 >= 0xf0u && byte_0 <= 0xf4u) {
-        if (byte_index + 3u >= byte_len) {
-            return invalid_utf8_scalar();
-        }
-        let byte_1 = string_byte(string_id, byte_index + 1u);
-        let byte_2 = string_byte(string_id, byte_index + 2u);
-        let byte_3 = string_byte(string_id, byte_index + 3u);
-        if (!is_utf8_continuation(byte_2) || !is_utf8_continuation(byte_3)) {
-            return invalid_utf8_scalar();
-        }
-
-        let second_is_valid =
-            (byte_0 == 0xf0u && byte_1 >= 0x90u && byte_1 <= 0xbfu)
-            || (byte_0 == 0xf4u && byte_1 >= 0x80u && byte_1 <= 0x8fu)
-            || (byte_0 >= 0xf1u && byte_0 <= 0xf3u && is_utf8_continuation(byte_1));
-        if (!second_is_valid) {
-            return invalid_utf8_scalar();
-        }
-
-        let code_point = ((byte_0 & 0x07u) << 18u)
-            | ((byte_1 & 0x3fu) << 12u)
-            | ((byte_2 & 0x3fu) << 6u)
-            | (byte_3 & 0x3fu);
-        return Utf8Scalar(code_point, 4u, 1u, 0u);
-    }
-
-    return invalid_utf8_scalar();
-}
-
-fn writer_push_utf8_string(writer: ptr<function, Writer>, string_id: u32) {
-    let string_info = string_meta[string_id];
-    var byte_index = 0u;
-    var scalar_count = 0u;
-
-    loop {
-        if (byte_index >= string_info.byte_len) {
-            break;
-        }
-
-        let scalar = decode_utf8_string(string_id, byte_index);
-        if (scalar.valid == 0u) {
-            writer_fail(writer, RESPONSE_FLAG_INVALID_UTF8);
-            return;
-        }
-
-        writer_push_code_point(writer, scalar.code_point);
-        byte_index = byte_index + scalar.byte_width;
-        scalar_count = scalar_count + 1u;
-    }
-
-    if (scalar_count != string_info.scalar_len) {
-        writer_fail(writer, RESPONSE_FLAG_INVALID_UTF8);
-    }
-}
-
 fn writer_finish(writer: Writer, status: u32) {
     if (writer.flags != 0u) {
         response_meta[writer.request_index] = ResponseMeta(0u, 500u, writer.flags, 0u);
         return;
     }
-
+    if ((writer.cursor & 3u) != 0u) {
+        let word_index = writer.request_index * params.response_stride_words + writer.cursor / 4u;
+        output_words[word_index] = writer.pending;
+    }
     response_meta[writer.request_index] = ResponseMeta(writer.cursor, status, 0u, 0u);
 }
 
@@ -359,11 +266,7 @@ fn is_get_request(request_index: u32, input_len: u32) -> bool {
     if (input_len < 4u) {
         return false;
     }
-
-    return request_byte(request_index, 0u) == 71u
-        && request_byte(request_index, 1u) == 69u
-        && request_byte(request_index, 2u) == 84u
-        && request_byte(request_index, 3u) == 32u;
+    return request_word(request_index, 0u) == 0x20544547u;
 }
 
 fn has_supported_http_version(request_index: u32, version_start: u32, input_len: u32) -> bool {
@@ -473,14 +376,23 @@ fn route_matches(request_index: u32, request_target: RequestTarget, route_index:
     }
 
     let route_string_id = route_word(route_index, ROUTE_PATH_STRING);
-    for (var byte_index = 0u; byte_index < request_target.path_len; byte_index = byte_index + 1u) {
+    var byte_index = 0u;
+    while (request_target.path_len - byte_index >= 4u) {
+        if (request_word(request_index, request_target.path_start + byte_index)
+            != string_word(route_string_id, byte_index))
+        {
+            return false;
+        }
+        byte_index = byte_index + 4u;
+    }
+    while (byte_index < request_target.path_len) {
         if (request_byte(request_index, request_target.path_start + byte_index)
             != string_byte(route_string_id, byte_index))
         {
             return false;
         }
+        byte_index = byte_index + 1u;
     }
-
     return true;
 }
 
@@ -578,7 +490,7 @@ fn write_response_body(
 
         switch opcode {
             case BODY_OP_LITERAL: {
-                writer_push_utf8_string(writer, arg_0);
+                writer_push_string(writer, arg_0);
             }
             case BODY_OP_PATH: {
                 writer_push_request_range(
@@ -606,7 +518,7 @@ fn write_response_body(
                 writer_push_decimal(writer, request_target.path_hash);
             }
             case BODY_OP_BACKEND_VARIANT: {
-                writer_push_utf8_string(writer, arg_1);
+                writer_push_string(writer, arg_1);
             }
             default: {
                 writer_fail(writer, RESPONSE_FLAG_INVALID_PROGRAM);

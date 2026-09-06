@@ -7,8 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result as AnyResult;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
+use anyhow::{Result as AnyResult, ensure};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded,
+};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tracing::{debug, error};
@@ -113,6 +115,9 @@ pub fn spawn_batcher(
     processor: Box<dyn Processor>,
     config: BatcherConfig,
 ) -> AnyResult<(BatcherHandle, thread::JoinHandle<()>)> {
+    ensure!(config.max_batch_size > 0, "max_batch_size must be positive");
+    ensure!(config.queue_depth > 0, "queue_depth must be positive");
+
     let (sender, receiver) = bounded(config.queue_depth);
     let metrics = Arc::new(BatcherMetrics::default());
     let worker_metrics = Arc::clone(&metrics);
@@ -125,6 +130,35 @@ pub fn spawn_batcher(
     Ok((BatcherHandle { sender, metrics }, worker))
 }
 
+fn collect_jobs(
+    receiver: &Receiver<Job>,
+    jobs: &mut Vec<Job>,
+    config: &BatcherConfig,
+) {
+    let started = Instant::now();
+    while jobs.len() < config.max_batch_size {
+        // A zero wait disables sleeping, not batching. Drain ready work before
+        // consulting the clock, including work queued during the last dispatch.
+        match receiver.try_recv() {
+            Ok(job) => {
+                jobs.push(job);
+                continue;
+            }
+            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {}
+        }
+
+        let remaining = config.max_batch_wait.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(job) => jobs.push(job),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 fn worker_loop(
     mut processor: Box<dyn Processor>,
     receiver: Receiver<Job>,
@@ -135,21 +169,10 @@ fn worker_loop(
 
     while let Ok(first) = receiver.recv() {
         let collection_started = Instant::now();
-        let deadline = collection_started + config.max_batch_wait;
         jobs.clear();
         jobs.push(first);
-
-        while jobs.len() < config.max_batch_size {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-
-            match receiver.recv_timeout(remaining) {
-                Ok(job) => jobs.push(job),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
-            }
-        }
+        collect_jobs(&receiver, &mut jobs, &config);
+        let collection_elapsed = collection_started.elapsed();
 
         let batch_size = jobs.len();
         metrics.batches.fetch_add(1, Ordering::Relaxed);
@@ -173,7 +196,7 @@ fn worker_loop(
         debug!(
             backend = processor.name(),
             batch_size,
-            collection_micros = collection_started.elapsed().as_micros(),
+            collection_micros = collection_elapsed.as_micros(),
             processing_micros = processing_elapsed.as_micros(),
             "processed request batch"
         );
@@ -243,6 +266,81 @@ mod tests {
             self.max_batch_seen
                 .fetch_max(requests.len(), Ordering::Relaxed);
             Ok(requests.iter().map(|request| request.to_vec()).collect())
+        }
+    }
+
+    fn job(value: u8) -> Job {
+        let (reply, _response) = oneshot::channel();
+        Job {
+            request: vec![value],
+            reply,
+        }
+    }
+
+    #[test]
+    fn zero_wait_drains_ready_work_in_order_without_exceeding_capacity() {
+        let (sender, receiver) = bounded(8);
+        for value in 1..=5 {
+            sender.send(job(value)).expect("queue has capacity");
+        }
+        let config = BatcherConfig {
+            max_batch_size: 4,
+            max_batch_wait: Duration::ZERO,
+            queue_depth: 8,
+        };
+        let mut jobs = vec![job(0)];
+        collect_jobs(&receiver, &mut jobs, &config);
+
+        let values: Vec<_> = jobs.iter().map(|job| job.request[0]).collect();
+        assert_eq!(values, [0, 1, 2, 3]);
+        assert_eq!(receiver.len(), 2);
+        assert_eq!(receiver.recv().expect("next job").request, [4]);
+    }
+
+    #[test]
+    fn zero_wait_returns_a_partial_batch_when_the_queue_is_empty() {
+        let (_sender, receiver) = bounded(8);
+        let config = BatcherConfig {
+            max_batch_size: 8,
+            max_batch_wait: Duration::ZERO,
+            queue_depth: 8,
+        };
+        let mut jobs = vec![job(0)];
+        collect_jobs(&receiver, &mut jobs, &config);
+        assert_eq!(jobs.len(), 1);
+    }
+
+    #[test]
+    fn disconnected_queue_is_drained_before_the_worker_stops() {
+        let (sender, receiver) = bounded(8);
+        sender.send(job(1)).expect("queued");
+        sender.send(job(2)).expect("queued");
+        drop(sender);
+        let config = BatcherConfig {
+            max_batch_size: 8,
+            max_batch_wait: Duration::from_secs(60),
+            queue_depth: 8,
+        };
+        let mut jobs = vec![job(0)];
+        collect_jobs(&receiver, &mut jobs, &config);
+        assert_eq!(jobs.len(), 3);
+    }
+
+    #[test]
+    fn rejects_zero_batch_or_queue_capacity_before_starting_a_worker() {
+        for (max_batch_size, queue_depth) in [(0, 8), (8, 0)] {
+            let processor = EchoProcessor {
+                max_batch_seen: Arc::new(AtomicUsize::new(0)),
+            };
+            let result = spawn_batcher(
+                Box::new(processor),
+                BatcherConfig {
+                    max_batch_size,
+                    max_batch_wait: Duration::ZERO,
+                    queue_depth,
+                },
+            );
+            assert!(result.is_err());
         }
     }
 
