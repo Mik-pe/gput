@@ -77,3 +77,12 @@ The current target is intentionally narrow:
 - a batched TUN adapter plus a single-threaded CPU packet reference
 
 Do not add TLS, HTTP/2, HTTP/3, a database, arbitrary middleware, or a general GPU heap until measurements justify expanding the blast radius.
+
+## Git delivery
+
+Squash-merge pull requests into main: one commit per PR. Update topic branches
+with ordinary merge commits. Never rebase or force-push. Fetch the current base
+and merge it into the topic branch when conflicts, integration changes, or branch
+protection require it;
+do not update every branch merely because another PR landed. Verify the current
+PR head before merging.
